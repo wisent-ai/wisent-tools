@@ -139,34 +139,54 @@ def upload_to_hf(activations_file: Path, model: str, task: str) -> None:
 from .auto_batch import auto_batch_size  # noqa: E402
 
 
-def hf_already_has_strategy(model: str, task: str, strategy: str, component: str) -> bool:
-    """True if every layer for (model, task, strategy) already exists on HF.
+def _list_hf_repo_files_once() -> list[str] | None:
+    """One-shot listing of every file in wisent-ai/activations.
 
-    Used as an idempotency check so a Spot-preempted job that gets requeued
-    doesn't re-extract strategies it had already finished + uploaded before
-    the preemption. Returns False on any HF query error so the caller treats
-    it as not-yet-done and proceeds with extraction (worst case: redundant
-    re-upload of an already-present shard, which the writer overwrites
-    deterministically).
+    The repo has thousands of files, so a single listing call hits HF
+    pagination + rate limits even with the SDK's 5x retry. Calling it
+    seven times (once per strategy) compounds the rate-limit risk;
+    sharing the result across all strategies drops it to one call.
+    Returns None on failure so callers treat each strategy as not-yet-done.
     """
     try:
         from huggingface_hub import HfApi
         from wisent.core.reading.modules.utilities.data.sources.hf.hf_config import (
-            HF_REPO_ID, HF_REPO_TYPE, model_to_safe_name,
+            HF_REPO_ID, HF_REPO_TYPE,
+        )
+        api = HfApi()
+        return list(api.list_repo_files(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE))
+    except Exception as exc:
+        print(f"[skip-check] HF listing unavailable: {exc}", flush=True)
+        return None
+
+
+def hf_already_has_strategy(
+    model: str,
+    task: str,
+    strategy: str,
+    component: str,
+    cached_files: list[str] | None,
+) -> bool:
+    """True if every layer for (model, task, strategy) already exists on HF.
+
+    Used as an idempotency check so a Spot-preempted job that gets requeued
+    doesn't re-extract strategies it had already finished + uploaded before
+    the preemption. Returns False when cached_files is None so the caller
+    proceeds with extraction (worst case: redundant re-upload of an
+    already-present shard, which the writer overwrites deterministically).
+    """
+    if cached_files is None:
+        return False
+    try:
+        from wisent.core.reading.modules.utilities.data.sources.hf.hf_config import (
+            model_to_safe_name,
         )
     except Exception:
         return False
-    try:
-        safe = model_to_safe_name(model)
-        hf_strategy = strategy if component == "residual_stream" else f"{strategy}/{component}"
-        prefix = f"activations/{safe}/{task}/{hf_strategy}/"
-        api = HfApi()
-        files = list(api.list_repo_files(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE))
-    except Exception as exc:
-        print(f"[skip-check] HF list failed for {task}/{strategy}: {exc}", flush=True)
-        return False
-    matching = [f for f in files if f.startswith(prefix)]
-    return len(matching) > 0
+    safe = model_to_safe_name(model)
+    hf_strategy = strategy if component == "residual_stream" else f"{strategy}/{component}"
+    prefix = f"activations/{safe}/{task}/{hf_strategy}/"
+    return any(f.startswith(prefix) for f in cached_files)
 
 
 def main() -> int:
@@ -195,9 +215,12 @@ def main() -> int:
     # Decide which strategies actually need extraction (skipping ones already
     # on HF), then load the model once if any remain. For large models this
     # cuts ~6x of weight-loading per task.
+    cached_hf_files = _list_hf_repo_files_once()
     pending = [
         s for s in args.strategies
-        if not hf_already_has_strategy(args.model, args.task, s, args.component)
+        if not hf_already_has_strategy(
+            args.model, args.task, s, args.component, cached_hf_files,
+        )
     ]
     skipped = [s for s in args.strategies if s not in pending]
     for s in skipped:
