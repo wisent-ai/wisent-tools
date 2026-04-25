@@ -61,21 +61,69 @@ def run_get_activations(
     device: str,
     batch_size: int,
     layers: str,
-) -> None:
-    cmd = [
-        _wisent_bin(), "get-activations", str(pairs_file),
-        "--output", str(output_file),
-        "--model", model,
-        "--device", device,
-        "--layers", layers,
-        "--extraction-strategy", strategy,
-        "--extraction-component", component,
-        "--batch-size", str(batch_size),
-    ]
-    print(f"[acts ] {' '.join(cmd)}", flush=True)
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        raise SystemExit(f"get-activations failed (rc={result.returncode}) for {strategy}")
+    cached_model=None,
+):
+    """Run wisent get-activations for one strategy.
+
+    Prefers the in-process path so all 7 strategies of a task reuse one
+    WisentModel load (~7x faster on large models). When the in-process
+    import path fails (e.g. older wisent without execute_get_activations),
+    runs the wisent CLI as a subprocess instead. Returns cached_model so
+    the caller threads the same model through subsequent strategies.
+    """
+    try:
+        from types import SimpleNamespace
+        from wisent.core.utils.cli.analysis.analysis.geometry.get_activations import (
+            execute_get_activations,
+        )
+        ns = SimpleNamespace(
+            pairs_file=str(pairs_file),
+            output=str(output_file),
+            model=model,
+            device=device,
+            layers=layers,
+            extraction_strategy=strategy,
+            extraction_component=component,
+            batch_size=batch_size,
+            verbose=False,
+            timing=False,
+            raw=False,
+            cached_model=cached_model,
+        )
+        execute_get_activations(ns)
+        return cached_model
+    except Exception as exc:
+        print(f"[acts ] in-process call failed ({exc}); using subprocess path", flush=True)
+        cmd = [
+            _wisent_bin(), "get-activations", str(pairs_file),
+            "--output", str(output_file),
+            "--model", model,
+            "--device", device,
+            "--layers", layers,
+            "--extraction-strategy", strategy,
+            "--extraction-component", component,
+            "--batch-size", str(batch_size),
+        ]
+        print(f"[acts ] {' '.join(cmd)}", flush=True)
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            raise SystemExit(f"get-activations failed (rc={result.returncode}) for {strategy}")
+        return None
+
+
+def _try_preload_model(model_id: str, device: str):
+    """Load the WisentModel once so all 7 strategies reuse it. Returns model or None."""
+    try:
+        from wisent.core.primitives.models.wisent_model import WisentModel
+    except Exception as exc:
+        print(f"[preload] WisentModel import failed ({exc}); strategies will each load their own", flush=True)
+        return None
+    try:
+        print(f"[preload] loading {model_id} on {device} (one-shot for all strategies)", flush=True)
+        return WisentModel(model_id, device=device)
+    except Exception as exc:
+        print(f"[preload] model load failed ({exc}); per-strategy load will be used", flush=True)
+        return None
 
 
 def upload_to_hf(activations_file: Path, model: str, task: str) -> None:
@@ -137,14 +185,22 @@ def main() -> int:
     generate_pairs(args.task, pairs_file)
     print(f"[{args.task}] pairs_file={pairs_file}", flush=True)
 
-    for strategy in args.strategies:
-        # Idempotency: if a previous (possibly preempted) attempt already
-        # uploaded this strategy's shards to HF, skip the re-extraction.
-        if hf_already_has_strategy(args.model, args.task, strategy, args.component):
-            print(f"[{args.task}] strategy={strategy} already on HF, skipping", flush=True)
-            continue
+    # Decide which strategies actually need extraction (skipping ones already
+    # on HF), then load the model once if any remain. For large models this
+    # cuts ~6x of weight-loading per task.
+    pending = [
+        s for s in args.strategies
+        if not hf_already_has_strategy(args.model, args.task, s, args.component)
+    ]
+    skipped = [s for s in args.strategies if s not in pending]
+    for s in skipped:
+        print(f"[{args.task}] strategy={s} already on HF, skipping", flush=True)
+
+    cached = _try_preload_model(args.model, args.device) if pending else None
+
+    for strategy in pending:
         out_file = work_dir / f"{args.task}__{strategy}.json"
-        run_get_activations(
+        cached = run_get_activations(
             pairs_file=pairs_file,
             output_file=out_file,
             model=args.model,
@@ -153,6 +209,7 @@ def main() -> int:
             device=args.device,
             batch_size=args.batch_size,
             layers=args.layers,
+            cached_model=cached,
         )
         upload_to_hf(out_file, args.model, args.task)
         print(f"[{args.task}] uploaded strategy={strategy}", flush=True)
