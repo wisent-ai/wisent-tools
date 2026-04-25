@@ -36,6 +36,7 @@ VALIDATED_STRATEGIES = [
     "mc_balanced",
     "role_play",
 ]
+DEFAULT_BATCH_FLOOR = 8
 
 
 def _wisent_bin() -> str:
@@ -175,7 +176,8 @@ def main() -> int:
     parser.add_argument("--strategies", nargs="+", default=VALIDATED_STRATEGIES)
     parser.add_argument("--component", default="residual_stream")
     parser.add_argument("--device", required=True)
-    parser.add_argument("--batch-size", type=int, required=True)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_FLOOR,
+                        help="Floor batch size; auto-tune may pick larger.")
     parser.add_argument("--layers", required=True)
     parser.add_argument(
         "--work-dir",
