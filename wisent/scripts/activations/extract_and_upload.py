@@ -133,51 +133,7 @@ def upload_to_hf(activations_file: Path, model: str, task: str) -> None:
     upload_extracted_activations(str(activations_file), model, task)
 
 
-def auto_batch_size(cached_model, device: str, requested: int, ceiling: int = 128) -> int:
-    """Probe the largest safe batch size on this GPU. Returns >= requested."""
-    if cached_model is None or not device.startswith("cuda"):
-        return requested
-    try:
-        import torch
-    except ImportError:
-        return requested
-    try:
-        hf = getattr(cached_model, "hf_model", None)
-        if hf is None:
-            return requested
-        cfg = hf.config
-        hidden = getattr(cfg, "hidden_size", 0) or getattr(cfg, "n_embd", 0)
-        layers = getattr(cfg, "num_hidden_layers", 0) or getattr(cfg, "n_layer", 0)
-        seq_len = min(512, getattr(cfg, "max_position_embeddings", 2048) or 2048)
-        if not hidden or not layers:
-            return requested
-        free_bytes, _ = torch.cuda.mem_get_info(0)
-        per_sample = hidden * seq_len * layers * 2 * 3  # fp16 * (q/k/v workspace)
-        candidate = max(requested, min(ceiling, int(0.70 * free_bytes / per_sample)))
-        if candidate <= requested:
-            return requested
-        print(f"[auto-bs] free={free_bytes/1e9:.1f}GB candidate={candidate}", flush=True)
-        device_obj = next(hf.parameters()).device
-        vocab = getattr(cfg, "vocab_size", 32000)
-        while candidate > requested:
-            try:
-                fake = torch.randint(0, vocab, (candidate, seq_len), device=device_obj)
-                with torch.no_grad():
-                    _ = hf(fake)
-                torch.cuda.empty_cache()
-                print(f"[auto-bs] OK batch_size={candidate}", flush=True)
-                return candidate
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                candidate //= 2
-                print(f"[auto-bs] OOM, retry batch_size={candidate}", flush=True)
-            except Exception as exc:
-                print(f"[auto-bs] probe failed: {exc}", flush=True)
-                return requested
-        return requested
-    except Exception as exc:
-        print(f"[auto-bs] error: {exc}", flush=True)
-        return requested
+from .auto_batch import auto_batch_size  # noqa: E402
 
 
 def hf_already_has_strategy(model: str, task: str, strategy: str, component: str) -> bool:
@@ -244,7 +200,10 @@ def main() -> int:
         print(f"[{args.task}] strategy={s} already on HF, skipping", flush=True)
 
     cached = _try_preload_model(args.model, args.device) if pending else None
-    effective_bs = auto_batch_size(cached, args.device, args.batch_size) if cached else args.batch_size
+    effective_bs = (
+        auto_batch_size(cached, args.device, args.batch_size, pairs_file=pairs_file)
+        if cached else args.batch_size
+    )
     if effective_bs != args.batch_size:
         print(f"[{args.task}] auto-tuned batch_size {args.batch_size} -> {effective_bs}", flush=True)
 
