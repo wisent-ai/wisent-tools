@@ -24,6 +24,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .profile_gpu import GPUProfiler, render_png
+
 
 VALIDATED_STRATEGIES = [
     "chat_last",
@@ -199,15 +201,28 @@ def main() -> int:
     for s in skipped:
         print(f"[{args.task}] strategy={s} already on HF, skipping", flush=True)
 
+    profiler = GPUProfiler(
+        csv_path=work_dir / f"{args.task}__profile.csv",
+        phases_path=work_dir / f"{args.task}__phases.csv",
+        interval_sec=3.0,
+    )
+    profiler.start()
+    profiler.mark_phase("start")
+
+    profiler.mark_phase("model_load")
     cached = _try_preload_model(args.model, args.device) if pending else None
+    profiler.mark_phase("model_loaded")
+    profiler.mark_phase("auto_batch_probe")
     effective_bs = (
         auto_batch_size(cached, args.device, args.batch_size, pairs_file=pairs_file)
         if cached else args.batch_size
     )
+    profiler.mark_phase(f"bs={effective_bs}")
     if effective_bs != args.batch_size:
         print(f"[{args.task}] auto-tuned batch_size {args.batch_size} -> {effective_bs}", flush=True)
 
     for strategy in pending:
+        profiler.mark_phase(f"extract_{strategy}")
         out_file = work_dir / f"{args.task}__{strategy}.json"
         cached = run_get_activations(
             pairs_file=pairs_file,
@@ -220,12 +235,20 @@ def main() -> int:
             layers=args.layers,
             cached_model=cached,
         )
+        profiler.mark_phase(f"upload_{strategy}")
         upload_to_hf(out_file, args.model, args.task)
         print(f"[{args.task}] uploaded strategy={strategy}", flush=True)
         try:
             out_file.unlink()
         except OSError:
             pass
+
+    profiler.mark_phase("done")
+    profiler.stop()
+    png_path = work_dir / f"{args.task}__profile.png"
+    if render_png(profiler.csv_path, profiler.phases_path, png_path,
+                  title=f"{args.task} on {args.model}"):
+        print(f"[profile] saved {png_path}", flush=True)
 
     try:
         pairs_file.unlink()
