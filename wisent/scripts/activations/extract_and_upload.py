@@ -110,7 +110,9 @@ def run_get_activations(
         print(f"[acts ] {' '.join(cmd)}", flush=True)
         result = subprocess.run(cmd)
         if result.returncode != 0:
-            raise SystemExit(f"get-activations failed (rc={result.returncode}) for {strategy}")
+            raise RuntimeError(
+                f"get-activations failed (rc={result.returncode}) for {strategy}"
+            )
         return None
 
 
@@ -246,20 +248,27 @@ def main() -> int:
     if effective_bs != args.batch_size:
         print(f"[{args.task}] auto-tuned batch_size {args.batch_size} -> {effective_bs}", flush=True)
 
+    failed_strategies: list[tuple[str, str]] = []
     for strategy in pending:
         profiler.mark_phase(f"extract_{strategy}")
         out_file = work_dir / f"{args.task}__{strategy}.json"
-        cached = run_get_activations(
-            pairs_file=pairs_file,
-            output_file=out_file,
-            model=args.model,
-            strategy=strategy,
-            component=args.component,
-            device=args.device,
-            batch_size=effective_bs,
-            layers=args.layers,
-            cached_model=cached,
-        )
+        try:
+            cached = run_get_activations(
+                pairs_file=pairs_file,
+                output_file=out_file,
+                model=args.model,
+                strategy=strategy,
+                component=args.component,
+                device=args.device,
+                batch_size=effective_bs,
+                layers=args.layers,
+                cached_model=cached,
+            )
+        except Exception as exc:
+            failed_strategies.append((strategy, str(exc)))
+            profiler.mark_phase(f"FAILED_{strategy}")
+            print(f"[{args.task}] strategy={strategy} extraction failed: {exc}; continuing", flush=True)
+            continue
         profiler.mark_phase(f"upload_{strategy}")
         upload_to_hf(out_file, args.model, args.task)
         print(f"[{args.task}] uploaded strategy={strategy}", flush=True)
@@ -279,6 +288,11 @@ def main() -> int:
         pairs_file.unlink()
     except OSError:
         pass
+    if failed_strategies:
+        print(f"[{args.task}] {len(failed_strategies)}/{len(pending)} strategies failed:", flush=True)
+        for s, e in failed_strategies:
+            print(f"  {s}: {e}", flush=True)
+        return 2 if len(failed_strategies) == len(pending) else 0
     return 0
 
 
