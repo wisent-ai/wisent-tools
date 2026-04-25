@@ -50,7 +50,11 @@ def auto_batch_size(
     pairs_file: Path | None = None,
     ceiling: int = 128,
 ) -> int:
-    """Probe the largest safe batch size on this GPU. Returns >= requested."""
+    """Measure-then-size: run one forward pass at batch=1 to learn real
+    bytes-per-sample on this GPU + this model + this seq_len, then scale
+    the candidate from that measurement. Falls back to a static formula
+    only if measurement fails. Probe-and-halve still guards the final pick.
+    """
     if cached_model is None or not device.startswith("cuda"):
         return requested
     try:
@@ -63,22 +67,43 @@ def auto_batch_size(
         if hf is None:
             return requested
         cfg = hf.config
-        hidden = getattr(cfg, "hidden_size", 0) or getattr(cfg, "n_embd", 0)
-        layers = getattr(cfg, "num_hidden_layers", 0) or getattr(cfg, "n_layer", 0)
-        if not hidden or not layers:
-            return requested
         if pairs_file and tok:
             seq_len = _measure_pairs_seq_len(pairs_file, tok)
         else:
             seq_len = min(512, getattr(cfg, "max_position_embeddings", 2048) or 2048)
-        free_bytes, _ = torch.cuda.mem_get_info(0)
-        per_sample = hidden * seq_len * layers * 2 * 3
-        candidate = max(requested, min(ceiling, int(0.70 * free_bytes / per_sample)))
-        if candidate <= requested:
-            return requested
-        print(f"[auto-bs] free={free_bytes/1e9:.1f}GB seq={seq_len} candidate={candidate}", flush=True)
         device_obj = next(hf.parameters()).device
         vocab = getattr(cfg, "vocab_size", 32000)
+
+        # Measurement pass: run one forward at batch=1 and see what it costs.
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device_obj)
+        baseline = torch.cuda.memory_allocated(device_obj)
+        try:
+            probe = torch.randint(0, vocab, (1, seq_len), device=device_obj)
+            with torch.no_grad():
+                _ = hf(probe)
+            peak = torch.cuda.max_memory_allocated(device_obj)
+            bytes_per_sample = max(1, peak - baseline)
+            torch.cuda.empty_cache()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print("[auto-bs] OOM at batch=1; falling back to requested floor", flush=True)
+            return requested
+
+        free_bytes, _ = torch.cuda.mem_get_info(0)
+        # 0.85 is the only soft constant left: leaves slack for activation
+        # accumulation and CUDA fragmentation. The 3x workspace guess from
+        # the v0.1.5 formula is gone — bytes_per_sample is measured.
+        candidate = max(requested, min(ceiling, int(0.85 * free_bytes / bytes_per_sample)))
+        print(
+            f"[auto-bs] measured per_sample={bytes_per_sample/1e6:.1f}MB "
+            f"free={free_bytes/1e9:.1f}GB seq={seq_len} candidate={candidate}",
+            flush=True,
+        )
+        if candidate <= requested:
+            return requested
+
+        # Confirm the candidate with one real probe; halve on OOM.
         while candidate > requested:
             try:
                 fake = torch.randint(0, vocab, (candidate, seq_len), device=device_obj)
