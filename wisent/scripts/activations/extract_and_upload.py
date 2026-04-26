@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
-"""Extract activations for ONE benchmark + model across all 7 strategies and upload to HF.
+"""Extract activations for ONE benchmark + model across 7 strategies; upload to HF.
 
-Pipeline per task:
-1. Generate (or HF-fetch) pair_texts via `wisent generate-pairs-from-task`.
-2. For each of the 7 validated strategies, run `wisent get-activations`
-   with extraction_component=residual_stream, --layers all.
-3. Upload every layer shard to wisent-ai/activations via
-   wisent.core.utils.cli.commands.optimize_steering.pipeline.find_best.activation_cache
-   .upload_extracted_activations.
-4. Delete the local activations JSON (HF shards are canonical).
-
-Designed to be invoked as:
-    python3 -m wisent.scripts.activations.extract_and_upload \
-        --task <task> --model <model_id> [--strategies S1 S2 ...] \
-        --device cuda --batch-size 8 --layers all
+Per-task pipeline: (1) `wisent generate-pairs-from-task` (HF-cached), (2) for each
+strategy, `wisent get-activations` on residual_stream / --layers all, (3) upload
+every layer shard to wisent-ai/activations, (4) delete local JSON.
 """
 from __future__ import annotations
 
@@ -46,8 +36,10 @@ def _wisent_bin() -> str:
     return found
 
 
-def generate_pairs(task: str, out_path: Path) -> None:
+def generate_pairs(task: str, out_path: Path, limit: int | None = None) -> None:
     cmd = [_wisent_bin(), "generate-pairs-from-task", task, "--output", str(out_path)]
+    if limit is not None and limit > 0:
+        cmd += ["--limit", str(limit)]
     print(f"[pairs] {' '.join(cmd)}", flush=True)
     result = subprocess.run(cmd)
     if result.returncode != 0 or not out_path.is_file():
@@ -201,6 +193,8 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_FLOOR,
                         help="Floor batch size; auto-tune may pick larger.")
     parser.add_argument("--layers", required=True)
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Cap on contrastive pairs (forwarded to generate-pairs-from-task).")
     parser.add_argument(
         "--work-dir",
         default=str(Path(tempfile.gettempdir()) / "wisent_activations_work"),
@@ -211,7 +205,7 @@ def main() -> int:
     work_dir.mkdir(parents=True, exist_ok=True)
     pairs_file = work_dir / f"{args.task}__pairs.json"
 
-    generate_pairs(args.task, pairs_file)
+    generate_pairs(args.task, pairs_file, limit=args.limit)
     print(f"[{args.task}] pairs_file={pairs_file}", flush=True)
 
     # Decide which strategies actually need extraction (skipping ones already
