@@ -43,6 +43,18 @@ def _measure_pairs_seq_len(pairs_file: Path, tokenizer, hard_cap: int = 2048) ->
         return 256
 
 
+def _count_pairs(pairs_file: Path) -> int | None:
+    """Count of contrastive pairs in the file, or None on read failure."""
+    try:
+        import json as _json
+        with pairs_file.open() as f:
+            data = _json.load(f)
+        pairs = data.get("pairs", data) if isinstance(data, dict) else data
+        return len(pairs) if pairs is not None else None
+    except Exception:
+        return None
+
+
 def auto_batch_size(
     cached_model,
     device: str,
@@ -91,10 +103,16 @@ def auto_batch_size(
             return requested
 
         free_bytes, _ = torch.cuda.mem_get_info(0)
+        # Cap by the actual number of pairs — batching beyond len(pairs) wastes
+        # VRAM with no throughput gain (the loop only ever has len(pairs)
+        # items to process), and a runaway probe at batch=128 with 5 pairs
+        # was eating ~80% of a T4 for nothing.
+        n_pairs = _count_pairs(pairs_file) if pairs_file else None
+        effective_ceiling = min(ceiling, n_pairs) if n_pairs else ceiling
         # 0.85 is the only soft constant left: leaves slack for activation
         # accumulation and CUDA fragmentation. The 3x workspace guess from
         # the v0.1.5 formula is gone — bytes_per_sample is measured.
-        candidate = max(requested, min(ceiling, int(0.85 * free_bytes / bytes_per_sample)))
+        candidate = max(requested, min(effective_ceiling, int(0.85 * free_bytes / bytes_per_sample)))
         print(
             f"[auto-bs] measured per_sample={bytes_per_sample/1e6:.1f}MB "
             f"free={free_bytes/1e9:.1f}GB seq={seq_len} candidate={candidate}",
