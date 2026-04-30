@@ -26,7 +26,27 @@ VALIDATED_STRATEGIES = [
     "mc_balanced",
     "role_play",
 ]
+# Strategies in the same family share an identical (full_text, answer_text,
+# prompt_only) tuple from build_extraction_texts, so they can share a forward
+# pass and only differ in the post-hoc per-layer aggregation.
+CHAT_FAMILY = {"chat_last", "chat_mean", "chat_first", "chat_max_norm", "chat_weighted"}
 DEFAULT_BATCH_FLOOR = 8
+
+
+def _group_strategies_by_family(strategies: list[str]) -> list[list[str]]:
+    """Group strategies that can share a forward pass.
+
+    chat_* are bundled together (one forward pass per pair → 5 strategies).
+    mc_balanced and role_play stay solo (their input texts differ).
+    """
+    chat = [s for s in strategies if s in CHAT_FAMILY]
+    other = [s for s in strategies if s not in CHAT_FAMILY]
+    groups: list[list[str]] = []
+    if chat:
+        groups.append(chat)
+    for s in other:
+        groups.append([s])
+    return groups
 
 
 def _wisent_bin() -> str:
@@ -106,6 +126,71 @@ def run_get_activations(
                 f"get-activations failed (rc={result.returncode}) for {strategy}"
             )
         return None
+
+
+def run_get_activations_group(
+    *,
+    pairs_file: Path,
+    output_dir: Path,
+    model: str,
+    strategies: list[str],
+    component: str,
+    device: str,
+    layers: str,
+    cached_model=None,
+) -> tuple[dict[str, Path], object]:
+    """Run a group of strategies sharing one forward pass per pair.
+
+    Falls back to per-strategy run_get_activations if the in-process
+    multi-strategy API is not available (older wisent).
+
+    Returns ({strategy: output_path}, cached_model).
+    """
+    if len(strategies) == 1 or cached_model is None:
+        outs: dict[str, Path] = {}
+        for s in strategies:
+            out_file = output_dir / f"{Path(pairs_file).stem.replace('__pairs','')}__{s}.json"
+            cached_model = run_get_activations(
+                pairs_file=pairs_file, output_file=out_file,
+                model=model, strategy=s, component=component,
+                device=device, batch_size=DEFAULT_BATCH_FLOOR,
+                layers=layers, cached_model=cached_model,
+            )
+            outs[s] = out_file
+        return outs, cached_model
+
+    try:
+        from wisent.core.utils.cli.analysis.analysis.geometry.get_activations import (
+            execute_get_activations_multi,
+        )
+    except Exception as exc:
+        print(f"[multi] in-process API unavailable ({exc}); falling back per-strategy", flush=True)
+        outs = {}
+        for s in strategies:
+            out_file = output_dir / f"{Path(pairs_file).stem.replace('__pairs','')}__{s}.json"
+            cached_model = run_get_activations(
+                pairs_file=pairs_file, output_file=out_file,
+                model=model, strategy=s, component=component,
+                device=device, batch_size=DEFAULT_BATCH_FLOOR,
+                layers=layers, cached_model=cached_model,
+            )
+            outs[s] = out_file
+        return outs, cached_model
+
+    print(f"[multi] running {len(strategies)} strategies in one forward pass per pair: {strategies}", flush=True)
+    written = execute_get_activations_multi(
+        pairs_file=str(pairs_file),
+        output_dir=str(output_dir),
+        model=cached_model,
+        model_name=model,
+        device=device,
+        layers=layers,
+        strategies=strategies,
+        component=component,
+        capture_qk=True,
+        verbose=False,
+    )
+    return {s: Path(p) for s, p in written.items()}, cached_model
 
 
 def _try_preload_model(model_id: str, device: str):
@@ -243,33 +328,40 @@ def main() -> int:
         print(f"[{args.task}] auto-tuned batch_size {args.batch_size} -> {effective_bs}", flush=True)
 
     failed_strategies: list[tuple[str, str]] = []
-    for strategy in pending:
-        profiler.mark_phase(f"extract_{strategy}")
-        out_file = work_dir / f"{args.task}__{strategy}.json"
+    groups = _group_strategies_by_family(pending)
+    for group in groups:
+        group_label = "+".join(group)
+        profiler.mark_phase(f"extract_{group_label}")
         try:
-            cached = run_get_activations(
+            outs, cached = run_get_activations_group(
                 pairs_file=pairs_file,
-                output_file=out_file,
+                output_dir=work_dir,
                 model=args.model,
-                strategy=strategy,
+                strategies=group,
                 component=args.component,
                 device=args.device,
-                batch_size=effective_bs,
                 layers=args.layers,
                 cached_model=cached,
             )
         except Exception as exc:
-            failed_strategies.append((strategy, str(exc)))
-            profiler.mark_phase(f"FAILED_{strategy}")
-            print(f"[{args.task}] strategy={strategy} extraction failed: {exc}; continuing", flush=True)
+            for s in group:
+                failed_strategies.append((s, str(exc)))
+            profiler.mark_phase(f"FAILED_{group_label}")
+            print(f"[{args.task}] group={group_label} extraction failed: {exc}; continuing", flush=True)
             continue
-        profiler.mark_phase(f"upload_{strategy}")
-        upload_to_hf(out_file, args.model, args.task)
-        print(f"[{args.task}] uploaded strategy={strategy}", flush=True)
-        try:
-            out_file.unlink()
-        except OSError:
-            pass
+        for strategy, out_file in outs.items():
+            profiler.mark_phase(f"upload_{strategy}")
+            try:
+                upload_to_hf(out_file, args.model, args.task)
+                print(f"[{args.task}] uploaded strategy={strategy}", flush=True)
+            except Exception as exc:
+                failed_strategies.append((strategy, str(exc)))
+                print(f"[{args.task}] strategy={strategy} upload failed: {exc}; continuing", flush=True)
+                continue
+            try:
+                out_file.unlink()
+            except OSError:
+                pass
 
     profiler.mark_phase("done")
     profiler.stop()
