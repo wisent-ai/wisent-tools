@@ -8,6 +8,7 @@ every layer shard to wisent-ai/activations, (4) delete local JSON.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -282,12 +283,26 @@ def main() -> int:
                         help="Cap on contrastive pairs (forwarded to generate-pairs-from-task).")
     parser.add_argument(
         "--work-dir",
-        default=str(Path(tempfile.gettempdir()) / "wisent_activations_work"),
+        default=None,
+        help="Per-job working dir. Defaults to a unique tempfile.mkdtemp() per "
+             "invocation so concurrent agent slots can't collide on shared "
+             "files (the previous shared default /tmp/wisent_activations_work "
+             "caused 'No such file or directory' failures when two jobs ran "
+             "the same task concurrently and one's cleanup wiped the other's "
+             "pairs file).",
     )
     args = parser.parse_args()
 
-    work_dir = Path(args.work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
+    if args.work_dir:
+        work_dir = Path(args.work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        owns_work_dir = False
+    else:
+        # Unique-per-invocation. Task name is in the prefix so logs/profile
+        # PNGs are still self-describing on disk before the rmtree at exit.
+        safe_task = "".join(c if c.isalnum() or c in "._-" else "_" for c in args.task)[:64]
+        work_dir = Path(tempfile.mkdtemp(prefix=f"wisent_act_{safe_task}_pid{os.getpid()}_"))
+        owns_work_dir = True
     pairs_file = work_dir / f"{args.task}__pairs.json"
 
     generate_pairs(args.task, pairs_file, limit=args.limit)
@@ -374,6 +389,16 @@ def main() -> int:
         pairs_file.unlink()
     except OSError:
         pass
+    if owns_work_dir:
+        # We mkdtemp'd it; rmtree the whole thing so the VM's /tmp doesn't
+        # accumulate one dir per task. Best-effort: profile PNG is the only
+        # artifact the operator might want to keep, and it's already been
+        # printed to stdout by render_png; the GCS uploader doesn't pick it
+        # up so it would be discarded on VM shutdown anyway.
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
     if failed_strategies:
         print(f"[{args.task}] {len(failed_strategies)}/{len(pending)} strategies failed:", flush=True)
         for s, e in failed_strategies:
