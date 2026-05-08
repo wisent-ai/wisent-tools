@@ -8,6 +8,8 @@ every layer shard to wisent-ai/activations, (4) delete local JSON.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
+import json
 import os
 import shutil
 import subprocess
@@ -55,6 +57,136 @@ def _wisent_bin() -> str:
     if not found:
         raise SystemExit("wisent CLI not found on PATH")
     return found
+
+
+def _filter_already_extracted_pairs(pairs_file, model, task, strategies, component):
+    """Read existing layer-1 shards on HF for (model, task, strategies); collect
+    every stable_id present; rewrite pairs_file to exclude those. Empties out
+    the file if nothing left. Idempotent re-runs no longer redo work."""
+    import json, hashlib
+    from huggingface_hub import hf_hub_download
+    from wisent.core.reading.modules.utilities.data.sources.hf.hf_config import (
+        HF_REPO_ID, HF_REPO_TYPE, model_to_safe_name,
+    )
+    from safetensors import safe_open
+    safe = model_to_safe_name(model)
+    extracted = set()
+    for s in strategies:
+        hf_strat = f"{s}/{component}" if component != "residual_stream" else s
+        for layer in (1,):  # stable_ids are layer-invariant; layer 1 is enough
+            hp = f"activations/{safe}/{task}/{hf_strat}/layer_{layer}.safetensors"
+            try:
+                local = hf_hub_download(
+                    repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE,
+                    filename=hp, token=os.environ.get("HF_TOKEN") or None,
+                )
+            except Exception:
+                continue
+            try:
+                with safe_open(local, framework="pt") as so:
+                    meta = so.metadata() or {}
+                ids = json.loads(meta.get("stable_ids", "[]"))
+                extracted.update(ids)
+            except Exception:
+                pass
+    if not extracted:
+        return
+    with open(pairs_file) as f:
+        doc = json.load(f)
+    pairs = doc.get("pairs", [])
+    def _sid(p):
+        s = p.get("stable_id","")
+        if s: return s
+        prompt = p.get("prompt","") or ""
+        pos_text = (p.get("positive_response",{}).get("text") or
+                    p.get("positive_response",{}).get("model_response") or "")
+        neg_text = (p.get("negative_response",{}).get("text") or
+                    p.get("negative_response",{}).get("model_response") or "")
+        return hashlib.sha256(
+            (prompt + "\x1f" + pos_text + "\x1f" + neg_text).encode("utf-8")
+        ).hexdigest()[:16]
+    kept = [p for p in pairs if _sid(p) not in extracted]
+    if len(kept) == len(pairs):
+        return
+    doc["pairs"] = kept
+    doc["num_pairs"] = len(kept)
+    with open(pairs_file, "w") as f:
+        json.dump(doc, f)
+    print(f"[{task}] skip {len(pairs)-len(kept)}/{len(pairs)} pairs already extracted; "
+          f"processing {len(kept)} new", flush=True)
+
+
+def _count_pairs_by_subtask(pairs_file: Path) -> tuple[int, dict[str, int]]:
+    """Read the pairs JSON and count pairs grouped by subtask metadata.
+
+    Returns (total_count, {subtask_name: count}). Best-effort: if the
+    pairs file is malformed or missing, returns (0, {}). Subtask name is
+    pulled from pair["metadata"]["task"|"subtask"|"dataset"], with a
+    "(default)" bucket when none is set (leaf tasks tend not to tag).
+    """
+    try:
+        if not pairs_file.is_file():
+            return 0, {}
+        data = json.loads(pairs_file.read_text())
+        pairs = data if isinstance(data, list) else (data.get("pairs") or [])
+        total = len(pairs)
+        sub: dict[str, int] = {}
+        for p in pairs:
+            md = p.get("metadata") if isinstance(p, dict) else None
+            md = md if isinstance(md, dict) else {}
+            key = md.get("task") or md.get("subtask") or md.get("dataset") or "(default)"
+            sub[key] = sub.get(key, 0) + 1
+        return total, sub
+    except Exception:
+        return 0, {}
+
+
+def _write_manifest(
+    *,
+    args,
+    pairs_initial_count: int,
+    pairs_initial_subtask_counts: dict[str, int],
+    pairs_post_filter_count: int,
+    pairs_post_filter_subtask_counts: dict[str, int],
+    pending: list[str],
+    failed_strategies: list[tuple[str, str]],
+) -> None:
+    """Drop a JSON manifest into /home/ubuntu/output where the runner's
+    startup script picks it up and uploads to
+    gs://<bucket>/status/<JOB_ID>/output/manifest.json. Lets the
+    wisent-enterprise dashboard show pairs-extracted-per-subtask without
+    parsing command_output.log."""
+    out_dir = Path(os.environ.get("WC_OUTPUT_DIR", "/home/ubuntu/output"))
+    if not out_dir.is_dir():
+        return
+    failed_set = {s for s, _ in failed_strategies}
+    uploaded = [s for s in pending if s not in failed_set]
+    manifest = {
+        "job_id": os.environ.get("JOB_ID")
+                  or os.environ.get("WC_JOB_ID")
+                  or "",
+        "model": args.model,
+        "task": args.task,
+        "limit": args.limit,
+        "component": args.component,
+        "layers": args.layers,
+        "pairs_initial_count": pairs_initial_count,
+        "pairs_initial_subtask_counts": pairs_initial_subtask_counts,
+        "pairs_post_filter_count": pairs_post_filter_count,
+        "pairs_post_filter_subtask_counts": pairs_post_filter_subtask_counts,
+        "strategies_pending": list(pending),
+        "strategies_uploaded": uploaded,
+        "strategies_failed": [{"strategy": s, "error": e[:240]}
+                              for s, e in failed_strategies],
+        "completed_at_utc": _dt.datetime.utcnow().isoformat() + "Z",
+        "manifest_schema_version": 1,
+    }
+    target = out_dir / "manifest.json"
+    try:
+        target.write_text(json.dumps(manifest, indent=2))
+        print(f"[{args.task}] manifest written to {target}", flush=True)
+    except Exception as exc:
+        print(f"[{args.task}] manifest write failed: {exc!r}", flush=True)
 
 
 def generate_pairs(task: str, out_path: Path, limit: int | None = None) -> None:
@@ -292,6 +424,12 @@ def main() -> int:
              "pairs file).",
     )
     args = parser.parse_args()
+    # Always print a startup line so command_output.log is never empty.
+    # If the script exits before any other output (e.g. an early-import
+    # crash or a shell wrapper failure), this line confirms the script
+    # at least started.
+    import datetime as _dt
+    print(f"[{args.task}] extract_and_upload start at {_dt.datetime.utcnow().isoformat()}Z model={args.model} strategies={args.strategies} layers={args.layers}", flush=True)
 
     if args.work_dir:
         work_dir = Path(args.work_dir)
@@ -307,6 +445,22 @@ def main() -> int:
 
     generate_pairs(args.task, pairs_file, limit=args.limit)
     print(f"[{args.task}] pairs_file={pairs_file}", flush=True)
+    pairs_initial_count, pairs_initial_subtask_counts = _count_pairs_by_subtask(pairs_file)
+    print(f"[{args.task}] pairs_initial_count={pairs_initial_count}", flush=True)
+
+    # Per-pair tracking: drop pairs whose stable_id already has activations
+    # on HF for THIS (model, task) — strategy-agnostic: if any strategy's
+    # layer-1 shard contains the stable_id, the pair has been processed.
+    # This prevents re-extraction across re-runs and lets follow-up jobs
+    # incrementally extend coverage. Falls through silently if HF is
+    # unavailable or no existing shards (first run).
+    try:
+        _filter_already_extracted_pairs(pairs_file, args.model, args.task,
+                                         args.strategies, args.component)
+    pairs_post_filter_count, pairs_post_filter_subtask_counts = _count_pairs_by_subtask(pairs_file)
+    print(f"[{args.task}] pairs_post_filter_count={pairs_post_filter_count}", flush=True)
+    except Exception as _exc:
+        print(f"[{args.task}] pair-skip check failed ({_exc}); processing all pairs", flush=True)
 
     # Decide which strategies actually need extraction (skipping ones already
     # on HF), then load the model once if any remain. For large models this
@@ -380,6 +534,16 @@ def main() -> int:
 
     profiler.mark_phase("done")
     profiler.stop()
+
+    _write_manifest(
+        args=args,
+        pairs_initial_count=pairs_initial_count,
+        pairs_initial_subtask_counts=pairs_initial_subtask_counts,
+        pairs_post_filter_count=pairs_post_filter_count,
+        pairs_post_filter_subtask_counts=pairs_post_filter_subtask_counts,
+        pending=list(pending),
+        failed_strategies=list(failed_strategies),
+    )
     png_path = work_dir / f"{args.task}__profile.png"
     if render_png(profiler.csv_path, profiler.phases_path, png_path,
                   title=f"{args.task} on {args.model}"):
@@ -403,7 +567,12 @@ def main() -> int:
         print(f"[{args.task}] {len(failed_strategies)}/{len(pending)} strategies failed:", flush=True)
         for s, e in failed_strategies:
             print(f"  {s}: {e}", flush=True)
-        return 2 if len(failed_strategies) == len(pending) else 0
+        # Any strategy failure -> non-zero. Earlier behavior masked HF 429
+        # rate-limit failures (5/7 strategies dying but script returning 0,
+        # marking the wisent-compute job COMPLETED despite missing uploads).
+        # Confirmed live 2026-05-06: 20/20 sampled completions had this
+        # exact pattern. Runner restart budget retries on a fresh VM.
+        return 2
     return 0
 
 
