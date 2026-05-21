@@ -102,6 +102,20 @@ def _command(model: str, task: str, strategy: str, limit: int, component: str) -
     )
 
 
+def _verify_command(model: str, task: str, strategy: str) -> str:
+    """Shell command the agent runs AFTER the main extract_and_upload exits 0.
+    A 404 from HF means the shard was never uploaded -- the agent then
+    routes the job to failed/ instead of completed/. Without this the
+    in-job _strategy_shard_state OPAQUE skip path makes exit=0 mean
+    'I exited cleanly without writing anything' which the queue used
+    to record as completed."""
+    uri = _shard_uri(model, task, strategy)
+    return (
+        f'curl --fail --silent --show-error --head -o /dev/null '
+        f'-H "Authorization: Bearer ${{HF_TOKEN}}" "{uri}"'
+    )
+
+
 class ActivationExtractionUniverse(Universe):
     """One UniverseEntry per (model, task, strategy) of activation extraction.
 
@@ -140,7 +154,10 @@ class ActivationExtractionUniverse(Universe):
                             model, task, strategy, self._limit, self._component
                         ),
                         expected_uri=_shard_uri(model, task, strategy),
-                        extra={"model": model, "task": task, "strategy": strategy},
+                        extra={
+                            "model": model, "task": task, "strategy": strategy,
+                            "verify_command": _verify_command(model, task, strategy),
+                        },
                     )
 
     def verifier(self) -> Verifier:
