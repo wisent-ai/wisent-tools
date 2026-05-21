@@ -1,7 +1,7 @@
 from setuptools import setup, find_namespace_packages
 setup(
     name="wisent-tools",
-    version="0.1.20",
+    version="0.1.36",
     author="Lukasz Bartoszcze and the Wisent Team",
     author_email="lukasz.bartoszcze@wisent.ai",
     description="Operational scripts and benchmark-evaluation runners for the wisent package family",
@@ -11,4 +11,9 @@ setup(
     install_requires=["wisent>=0.11.21", "wisent-evaluators>=0.1.0", "matplotlib>=3.0"],
     include_package_data=True,
     package_data={"wisent": ["scripts/*.sh"]},
+    entry_points={
+        "wisent_compute.coverage_universes": [
+            "activation-extraction = wisent.scripts._helpers.submission.activation_universe:ActivationExtractionUniverse",
+        ],
+    },
 )

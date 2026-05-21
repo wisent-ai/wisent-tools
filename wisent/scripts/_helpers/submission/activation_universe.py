@@ -1,0 +1,110 @@
+"""Activation-extraction Universe adapter for wisent_compute.coverage.
+
+Per (model, task, strategy) tuple yields a UniverseEntry whose:
+  - group_key    is safe(model)/task/strategy (state-file key)
+  - command      is the wisent.scripts.activations.extract_and_upload
+                 invocation that would produce the expected_uri
+  - expected_uri is the HF wisent-ai/activations layer_1.safetensors
+                 shard URL for that triple
+
+Verifier is URIExistsVerifier seeded with HF_TOKEN.
+
+The class contains no orchestration: walking, retrying, state tracking,
+and submit_batch live in wisent_compute.coverage. This file is purely
+the consumer-side answer to "what is the expected universe for
+activation extraction" and is registered via setup.py entry_points
+group wisent_compute.coverage_universes so
+wisent_compute.coverage.discover_universes() finds it without
+wisent-compute depending on wisent or wisent-tools.
+"""
+from __future__ import annotations
+
+import os
+from typing import Iterator
+
+from wisent_compute.coverage import (
+    Universe,
+    UniverseEntry,
+    URIExistsVerifier,
+    Verifier,
+)
+
+from wisent.scripts.activations.extract_and_upload import VALIDATED_STRATEGIES
+from wisent.scripts._helpers.submission.submit_top_level_benchmarks import (
+    load_benchmark_names,
+)
+
+HF_REPO = "wisent-ai/activations"
+HF_BASE = "https://huggingface.co"
+
+
+def _safe(model: str) -> str:
+    return model.replace("/", "__")
+
+
+def _shard_uri(model: str, task: str, strategy: str) -> str:
+    return (
+        f"{HF_BASE}/datasets/{HF_REPO}/resolve/main/"
+        f"activations/{_safe(model)}/{task}/{strategy}/layer_1.safetensors"
+    )
+
+
+def _command(model: str, task: str, strategy: str, limit: int, component: str) -> str:
+    return (
+        f"python3 -m wisent.scripts.activations.extract_and_upload "
+        f"--task {task} --model '{model}' --device cuda "
+        f"--layers all --strategies {strategy} "
+        f"--component {component} --limit {limit}"
+    )
+
+
+class ActivationExtractionUniverse(Universe):
+    """One UniverseEntry per (model, task, strategy) of activation extraction.
+
+    Construct with the explicit model list + per-job knobs you want this
+    coverage cycle to target. discover_universes() returns this class
+    (not an instance); the CLI / caller instantiates with the right
+    models and limit for the current cycle.
+    """
+
+    def __init__(
+        self,
+        models: list[str],
+        limit: int,
+        component: str = "residual_stream",
+        priority: int = 0,
+    ):
+        if not models:
+            raise ValueError("ActivationExtractionUniverse needs at least one model")
+        self._models = list(models)
+        self._limit = int(limit)
+        self._component = component
+        self._priority = int(priority)
+
+    @property
+    def id(self) -> str:
+        return "activation-extraction"
+
+    def iter_entries(self) -> Iterator[UniverseEntry]:
+        tasks = load_benchmark_names()
+        for model in self._models:
+            for task in tasks:
+                for strategy in VALIDATED_STRATEGIES:
+                    yield UniverseEntry(
+                        group_key=f"{_safe(model)}/{task}/{strategy}",
+                        command=_command(
+                            model, task, strategy, self._limit, self._component
+                        ),
+                        expected_uri=_shard_uri(model, task, strategy),
+                        extra={"model": model, "task": task, "strategy": strategy},
+                    )
+
+    def verifier(self) -> Verifier:
+        return URIExistsVerifier(bearer_token=os.environ.get("HF_TOKEN", ""))
+
+    def submit_kwargs(self) -> dict:
+        return {
+            "provider": "gcp",
+            "preemptible": False,
+            "priority": self._priority,
+        }
