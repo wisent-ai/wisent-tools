@@ -95,6 +95,7 @@ def main() -> int:
     print(f"Submitting {len(names)} top-level jobs for {args.model}", flush=True)
 
     safe_model = args.model.replace("/", "__")
+    strategy_list = args.strategies.split()
     pairs: list[tuple[str, str]] = []
     for name in names:
         cmd = (f"python3 -m wisent.scripts.activations.extract_and_upload "
@@ -103,16 +104,19 @@ def main() -> int:
                f"--component {args.component} --limit {args.limit}")
         # Post-run HF existence check. Without verify_command, slots.py
         # marks the job COMPLETED on exit=0 even when extract_and_upload
-        # SKIPPED every requested strategy (OPAQUE pre-stable_ids shard
-        # path) and uploaded zero shards. HEAD chat_first/layer_1
-        # for THIS (model, task): if missing, the job produced nothing
-        # new and gets demoted to failed/ with the curl error.
-        uri = (f"https://huggingface.co/datasets/wisent-ai/activations/"
-               f"resolve/main/activations/{safe_model}/{name}/chat_first/"
-               f"layer_1.safetensors")
-        verify = (f'curl --fail --silent --show-error --head -o /dev/null '
-                  f'-H "Authorization: Bearer ${{HF_TOKEN}}" "{uri}"')
-        pairs.append((cmd, verify))
+        # uploaded a partial set of strategies (job 00f34aa3 on
+        # 2026-05-20: 3 of 7 strategies uploaded, 4 missing, marked
+        # completed). HEAD each requested strategy's layer_1.safetensors;
+        # ANY missing strategy demotes the job to failed/ with the
+        # curl error text.
+        heads = " && ".join(
+            f'curl --fail --silent --show-error --head -o /dev/null '
+            f'-H "Authorization: Bearer ${{HF_TOKEN}}" '
+            f'"https://huggingface.co/datasets/wisent-ai/activations/'
+            f'resolve/main/activations/{safe_model}/{name}/{s}/layer_1.safetensors"'
+            for s in strategy_list
+        )
+        pairs.append((cmd, heads))
     if args.dry_run:
         for c, _v in pairs:
             print(c)
