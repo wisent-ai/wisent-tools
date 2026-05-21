@@ -50,6 +50,32 @@ def _wisent_bin() -> str:
     return found
 
 
+def _strip_broken_torchvision() -> None:
+    """Uninstall torchvision when present + incompatible with installed
+    torch. wisent CLI -> transformers -> torchvision top-level import
+    fails at `torch.library.register_fake("torchvision::nms")` with
+    `RuntimeError: operator torchvision::nms does not exist` on agents
+    where torchvision was built against a different torch ABI
+    (confirmed live 2026-05-21 on 18+ raw jobs). Text/audio/robotics
+    extraction does not need torchvision."""
+    try:
+        import torchvision  # noqa: F401
+    except Exception:
+        return
+    try:
+        import torch
+        torch._C._dispatch_has_kernel_for_dispatch_key("torchvision::nms", "Meta")
+        return
+    except Exception:
+        pass
+    print("[raw] torchvision/torch ABI mismatch; uninstalling torchvision", flush=True)
+    _subprocess.run(
+        [sys.executable, "-m", "pip", "uninstall", "-y", "torchvision",
+         "--break-system-packages"],
+        capture_output=True,
+    )
+
+
 def generate_pairs(task: str, out_path: Path, limit=None) -> None:
     cmd = [_wisent_bin(), "generate-pairs-from-task", task, "--output", str(out_path)]
     if limit is not None and limit > 0:
@@ -234,6 +260,7 @@ def main() -> int:
         f"model={args.model} layers={args.layers}",
         flush=True,
     )
+    _strip_broken_torchvision()
     try:
         generate_pairs(args.task, pairs_file, limit=args.limit)
         cached = _try_preload_model(args.model, args.device)
