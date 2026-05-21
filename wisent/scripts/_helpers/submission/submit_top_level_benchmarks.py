@@ -94,28 +94,44 @@ def main() -> int:
     names = [n for n in names if n not in excludes]
     print(f"Submitting {len(names)} top-level jobs for {args.model}", flush=True)
 
-    commands = []
+    safe_model = args.model.replace("/", "__")
+    pairs: list[tuple[str, str]] = []
     for name in names:
         cmd = (f"python3 -m wisent.scripts.activations.extract_and_upload "
                f"--task {name} --model '{args.model}' --device {args.device} "
                f"--layers {args.layers} --strategies {args.strategies} "
                f"--component {args.component} --limit {args.limit}")
-        commands.append(cmd)
+        # Post-run HF existence check. Without verify_command, slots.py
+        # marks the job COMPLETED on exit=0 even when extract_and_upload
+        # SKIPPED every requested strategy (OPAQUE pre-stable_ids shard
+        # path) and uploaded zero shards. HEAD chat_first/layer_1
+        # for THIS (model, task): if missing, the job produced nothing
+        # new and gets demoted to failed/ with the curl error.
+        uri = (f"https://huggingface.co/datasets/wisent-ai/activations/"
+               f"resolve/main/activations/{safe_model}/{name}/chat_first/"
+               f"layer_1.safetensors")
+        verify = (f'curl --fail --silent --show-error --head -o /dev/null '
+                  f'-H "Authorization: Bearer ${{HF_TOKEN}}" "{uri}"')
+        pairs.append((cmd, verify))
     if args.dry_run:
-        for c in commands:
+        for c, _v in pairs:
             print(c)
         return 0
 
     from wisent_compute.config import BUCKET as _BUCKET
-    from wisent_compute.queue.submit import submit_batch as _submit_batch
+    from wisent_compute.queue.submit import submit_job as _submit_job
     import time as _time
     batch_id = f"batch-{int(_time.time())}-{args.model.replace('/', '_')}"
-    n = _submit_batch(
-        commands, provider="gcp", batch_id=batch_id, bucket=_BUCKET,
-        preemptible=False, pin_to_provider=True, priority=args.priority,
-    )
-    print(f"\nSubmitted: {n}/{len(commands)}  batch_id={batch_id}")
-    return 0 if n == len(commands) else 1
+    n = 0
+    for cmd, verify in pairs:
+        _submit_job(
+            cmd, provider="gcp", batch_id=batch_id, bucket=_BUCKET,
+            preemptible=False, pin_to_provider=True, priority=args.priority,
+            verify_command=verify,
+        )
+        n += 1
+    print(f"\nSubmitted: {n}/{len(pairs)}  batch_id={batch_id}")
+    return 0 if n == len(pairs) else 1
 
 
 if __name__ == "__main__":
