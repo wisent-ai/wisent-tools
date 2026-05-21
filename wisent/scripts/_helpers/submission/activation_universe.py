@@ -29,16 +29,18 @@ from wisent_compute.coverage import (
     Verifier,
 )
 
-from wisent.scripts._helpers.submission.submit_top_level_benchmarks import (
-    load_benchmark_names,
-)
+import json
+from pathlib import Path
 
-# Canonical 7-strategy list. This duplicates VALIDATED_STRATEGIES in
+# Canonical 7-strategy list. Duplicates VALIDATED_STRATEGIES in
 # wisent.scripts.activations.extract_and_upload to avoid importing that
 # module: as of wisent-tools 0.1.20 (commit 98a483e) extract_and_upload
 # has a SyntaxError at line 460 (try-block indentation), so any import
-# of it raises and would break this Universe's discovery via entry_points.
-# Update both lists together when strategies change.
+# of it raises and would break entry-point discovery here. Same logic
+# inlines load_benchmark_names to avoid pulling in
+# wisent.scripts._helpers.submission.submit_top_level_benchmarks which
+# transitively imports wisent.core...constants, pulling tensorflow,
+# pulling a broken protobuf version. Update both lists together.
 VALIDATED_STRATEGIES = [
     "chat_last",
     "chat_mean",
@@ -48,6 +50,33 @@ VALIDATED_STRATEGIES = [
     "mc_balanced",
     "role_play",
 ]
+
+
+def load_benchmark_names() -> list[str]:
+    """Return sorted benchmark_tags.json keys.
+
+    Inlined here (instead of imported from submit_top_level_benchmarks)
+    so this module has no transitive import chain that touches
+    wisent.core.* — the entry-point loader needs to import this at
+    `wc-coverage` startup without pulling in the full wisent dep graph.
+    """
+    candidates: list[Path] = []
+    try:
+        import wisent as _w
+        candidates.append(Path(_w.__file__).parent / "support" / "examples"
+                          / "scripts" / "benchmark_tags.json")
+    except Exception:
+        pass
+    candidates += [
+        Path("/opt/wisent-agent/.venv/lib/python3.10/site-packages/wisent"
+             "/support/examples/scripts/benchmark_tags.json"),
+        Path("/usr/local/lib/python3.13/site-packages/wisent/support"
+             "/examples/scripts/benchmark_tags.json"),
+    ]
+    for p in candidates:
+        if p.is_file():
+            return sorted(json.loads(p.read_text()).keys())
+    raise RuntimeError("benchmark_tags.json not found")
 
 HF_REPO = "wisent-ai/activations"
 HF_BASE = "https://huggingface.co"
