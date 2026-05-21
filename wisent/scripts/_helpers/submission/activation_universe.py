@@ -1,25 +1,37 @@
 """Activation-extraction Universe adapter for wisent_compute.coverage.
 
-Per (model, task, strategy) tuple yields a UniverseEntry whose:
-  - group_key    is safe(model)/task/strategy (state-file key)
-  - command      is the wisent.scripts.activations.extract_and_upload
-                 invocation that would produce the expected_uri
-  - expected_uri is the HF wisent-ai/activations layer_1.safetensors
-                 shard URL for that triple
+CANONICAL DESIGN — RAW THEN TRANSFORM:
 
-Verifier is URIExistsVerifier seeded with HF_TOKEN.
+Per (model, task) we extract exactly **3 raw activation forward passes**:
+  - chat         (raw activations for the chat-template prompt format)
+  - mc_balanced  (raw activations for the multiple-choice prompt format)
+  - role_play    (raw activations for the role-play prompt format)
 
-The class contains no orchestration: walking, retrying, state tracking,
-and submit_batch live in wisent_compute.coverage. This file is purely
-the consumer-side answer to "what is the expected universe for
-activation extraction" and is registered via setup.py entry_points
-group wisent_compute.coverage_universes so
-wisent_compute.coverage.discover_universes() finds it without
-wisent-compute depending on wisent or wisent-tools.
+The 7 "strategies" (chat_last / chat_mean / chat_first / chat_max_norm /
+chat_weighted / mc_balanced / role_play) are post-hoc aggregations
+derived from those 3 raw shards. Specifically chat_{last, mean, first,
+max_norm, weighted} are 5 different per-token aggregations of the SAME
+raw chat forward pass; mc_balanced and role_play map 1:1 to their raw
+forward passes.
+
+Per (model, task, prompt_format) yields a UniverseEntry whose:
+  - group_key    is safe(model)/task/prompt_format (state-file key)
+  - command      is the raw extraction invocation that would produce
+                 the expected_uri
+  - expected_uri is gs/HF raw_activations layer_1_chunk_0.safetensors
+  - extra        carries the verify_command HEADing expected_uri
+
+The raw_activations/<safe>/<task>/<prompt_format>/layer_<L>_chunk_<C>
+layout is the one migrate_raw.py populates from the Supabase→HF
+migration; new extractions should target the same layout instead of
+the redundant 7-strategy activations/<safe>/<task>/<strategy>/ tree
+that extract_and_upload currently writes.
 """
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from typing import Iterator
 
 from wisent_compute.coverage import (
@@ -29,27 +41,18 @@ from wisent_compute.coverage import (
     Verifier,
 )
 
-import json
-from pathlib import Path
+# Canonical 3 raw forward-pass prompt formats. The 7 VALIDATED_STRATEGIES
+# are downstream aggregations of these — chat_{last,mean,first,max_norm,
+# weighted} all derive from raw `chat`, mc_balanced is raw `mc_balanced`,
+# role_play is raw `role_play`. Stored at raw_activations/<safe>/<task>/
+# <prompt_format>/layer_<L>_chunk_<C>.safetensors per migrate_raw.py
+# convention.
+RAW_PROMPT_FORMATS = ["chat", "mc_balanced", "role_play"]
 
-# Canonical 7-strategy list. Duplicates VALIDATED_STRATEGIES in
-# wisent.scripts.activations.extract_and_upload to avoid importing that
-# module: as of wisent-tools 0.1.20 (commit 98a483e) extract_and_upload
-# has a SyntaxError at line 460 (try-block indentation), so any import
-# of it raises and would break entry-point discovery here. Same logic
-# inlines load_benchmark_names to avoid pulling in
-# wisent.scripts._helpers.submission.submit_top_level_benchmarks which
-# transitively imports wisent.core...constants, pulling tensorflow,
-# pulling a broken protobuf version. Update both lists together.
-VALIDATED_STRATEGIES = [
-    "chat_last",
-    "chat_mean",
-    "chat_first",
-    "chat_max_norm",
-    "chat_weighted",
-    "mc_balanced",
-    "role_play",
-]
+HF_REPO = "wisent-ai/activations"
+HF_BASE = "https://huggingface.co"
+RAW_LAYER = 1
+RAW_CHUNK = 0
 
 
 def load_benchmark_names() -> list[str]:
@@ -78,38 +81,45 @@ def load_benchmark_names() -> list[str]:
             return sorted(json.loads(p.read_text()).keys())
     raise RuntimeError("benchmark_tags.json not found")
 
-HF_REPO = "wisent-ai/activations"
-HF_BASE = "https://huggingface.co"
-
 
 def _safe(model: str) -> str:
     return model.replace("/", "__")
 
 
-def _shard_uri(model: str, task: str, strategy: str) -> str:
+def _raw_shard_uri(model: str, task: str, prompt_format: str) -> str:
+    """raw_activations/<safe>/<task>/<prompt_format>/layer_1_chunk_0.safetensors
+    URL on HF wisent-ai/activations — the canonical raw-forward-pass shard.
+    """
     return (
         f"{HF_BASE}/datasets/{HF_REPO}/resolve/main/"
-        f"activations/{_safe(model)}/{task}/{strategy}/layer_1.safetensors"
+        f"raw_activations/{_safe(model)}/{task}/{prompt_format}/"
+        f"layer_{RAW_LAYER}_chunk_{RAW_CHUNK}.safetensors"
     )
 
 
-def _command(model: str, task: str, strategy: str, limit: int, component: str) -> str:
+def _command(model: str, task: str, prompt_format: str, limit: int, component: str) -> str:
+    """Raw-extraction command. Targets the raw forward pass for one
+    prompt_format and writes raw_activations/... (not the legacy 7-strategy
+    activations/... tree). extract_and_upload accepts --strategies; the
+    raw-mode invocation passes the prompt_format as the strategy name
+    (chat / mc_balanced / role_play) and relies on the script's
+    raw-output mode. If the installed extract_and_upload still writes the
+    aggregated activations/<strategy>/ layout, this command produces no
+    expected_uri match and the verifier reports the entry MISSING — that
+    is the truth the agreed design expects to surface."""
     return (
         f"python3 -m wisent.scripts.activations.extract_and_upload "
         f"--task {task} --model '{model}' --device cuda "
-        f"--layers all --strategies {strategy} "
+        f"--layers all --strategies {prompt_format} --raw "
         f"--component {component} --limit {limit}"
     )
 
 
-def _verify_command(model: str, task: str, strategy: str) -> str:
-    """Shell command the agent runs AFTER the main extract_and_upload exits 0.
-    A 404 from HF means the shard was never uploaded -- the agent then
-    routes the job to failed/ instead of completed/. Without this the
-    in-job _strategy_shard_state OPAQUE skip path makes exit=0 mean
-    'I exited cleanly without writing anything' which the queue used
-    to record as completed."""
-    uri = _shard_uri(model, task, strategy)
+def _verify_command(model: str, task: str, prompt_format: str) -> str:
+    """Post-run HEAD against the expected raw_activations URI. A 404
+    routes the job to failed/ instead of completed/, closing the bug
+    that let exit=0 mean 'I uploaded nothing' (job 00f34aa3, 2026-05-20)."""
+    uri = _raw_shard_uri(model, task, prompt_format)
     return (
         f'curl --fail --silent --show-error --head -o /dev/null '
         f'-H "Authorization: Bearer ${{HF_TOKEN}}" "{uri}"'
@@ -117,7 +127,8 @@ def _verify_command(model: str, task: str, strategy: str) -> str:
 
 
 class ActivationExtractionUniverse(Universe):
-    """One UniverseEntry per (model, task, strategy) of activation extraction.
+    """Yields one UniverseEntry per (model, task, prompt_format) raw
+    forward pass. 3 entries per (model, task), not 7.
 
     Construct with the explicit model list + per-job knobs you want this
     coverage cycle to target. discover_universes() returns this class
@@ -147,16 +158,18 @@ class ActivationExtractionUniverse(Universe):
         tasks = load_benchmark_names()
         for model in self._models:
             for task in tasks:
-                for strategy in VALIDATED_STRATEGIES:
+                for prompt_format in RAW_PROMPT_FORMATS:
                     yield UniverseEntry(
-                        group_key=f"{_safe(model)}/{task}/{strategy}",
+                        group_key=f"{_safe(model)}/{task}/{prompt_format}",
                         command=_command(
-                            model, task, strategy, self._limit, self._component
+                            model, task, prompt_format, self._limit, self._component
                         ),
-                        expected_uri=_shard_uri(model, task, strategy),
+                        expected_uri=_raw_shard_uri(model, task, prompt_format),
                         extra={
-                            "model": model, "task": task, "strategy": strategy,
-                            "verify_command": _verify_command(model, task, strategy),
+                            "model": model,
+                            "task": task,
+                            "prompt_format": prompt_format,
+                            "verify_command": _verify_command(model, task, prompt_format),
                         },
                     )
 
