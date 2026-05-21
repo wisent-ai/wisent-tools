@@ -99,18 +99,15 @@ def _raw_shard_uri(model: str, task: str, prompt_format: str) -> str:
 
 def _command(model: str, task: str, prompt_format: str, limit: int, component: str) -> str:
     """Raw-extraction command. Targets the raw forward pass for one
-    prompt_format and writes raw_activations/... (not the legacy 7-strategy
-    activations/... tree). extract_and_upload accepts --strategies; the
-    raw-mode invocation passes the prompt_format as the strategy name
-    (chat / mc_balanced / role_play) and relies on the script's
-    raw-output mode. If the installed extract_and_upload still writes the
-    aggregated activations/<strategy>/ layout, this command produces no
-    expected_uri match and the verifier reports the entry MISSING — that
-    is the truth the agreed design expects to surface."""
+    prompt_format and writes raw_activations/<safe>/<task>/<prompt_format>/
+    layer_<L>_chunk_<C>.safetensors via the dedicated entry point
+    wisent.scripts.activations.raw.extract_and_upload (not the legacy
+    7-strategy activations/<strategy>/ tree that the parent
+    extract_and_upload writes)."""
     return (
-        f"python3 -m wisent.scripts.activations.extract_and_upload "
+        f"python3 -m wisent.scripts.activations.raw.extract_and_upload "
         f"--task {task} --model '{model}' --device cuda "
-        f"--layers all --strategies {prompt_format} --raw "
+        f"--layers all --prompt-format {prompt_format} "
         f"--component {component} --limit {limit}"
     )
 
