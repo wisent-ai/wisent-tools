@@ -29,11 +29,50 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-from wisent.scripts.activations.extract_and_upload import (
-    DEFAULT_BATCH_FLOOR,
-    _try_preload_model,
-    generate_pairs,
-)
+# Helpers inlined to avoid `from wisent.scripts.activations.extract_and_upload`
+# — that module has a SyntaxError at line 460 in the published wheel (try/except
+# block indentation bug) and any import of it raises before this module can
+# load. Confirmed live 2026-05-21 on job 4394727f: the agent attempted to
+# import raw.extract_and_upload, the chain hit the broken parent, and the job
+# failed at runpy with the line-460 SyntaxError. Inline the three names we
+# need (DEFAULT_BATCH_FLOOR + _try_preload_model + generate_pairs) so this
+# module has zero dependency on the broken parent.
+import shutil as _shutil
+import subprocess as _subprocess
+
+DEFAULT_BATCH_FLOOR = 8
+
+
+def _wisent_bin() -> str:
+    found = _shutil.which("wisent")
+    if not found:
+        raise SystemExit("wisent CLI not found on PATH")
+    return found
+
+
+def generate_pairs(task: str, out_path: Path, limit=None) -> None:
+    cmd = [_wisent_bin(), "generate-pairs-from-task", task, "--output", str(out_path)]
+    if limit is not None and limit > 0:
+        cmd += ["--limit", str(limit)]
+    print(f"[pairs] {' '.join(cmd)}", flush=True)
+    result = _subprocess.run(cmd)
+    if result.returncode != 0 or not out_path.is_file():
+        raise SystemExit(f"pair_texts generation failed for {task} (rc={result.returncode})")
+
+
+def _try_preload_model(model_id: str, device: str):
+    """Load the WisentModel once so all layers share it. Returns model or None."""
+    try:
+        from wisent.core.primitives.models.wisent_model import WisentModel
+    except Exception as exc:
+        print(f"[preload] WisentModel import failed ({exc}); per-strategy load will be used", flush=True)
+        return None
+    try:
+        print(f"[preload] loading {model_id} on {device} (one-shot)", flush=True)
+        return WisentModel(model_id, device=device)
+    except Exception as exc:
+        print(f"[preload] model load failed ({exc}); per-strategy load will be used", flush=True)
+        return None
 
 HF_REPO_ID = "wisent-ai/activations"
 HF_REPO_TYPE = "dataset"

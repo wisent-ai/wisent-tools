@@ -1,7 +1,7 @@
 from setuptools import setup, find_namespace_packages
 setup(
     name="wisent-tools",
-    version="0.1.44",
+    version="0.1.45",
     author="Lukasz Bartoszcze and the Wisent Team",
     author_email="lukasz.bartoszcze@wisent.ai",
     description="Operational scripts and benchmark-evaluation runners for the wisent package family",
