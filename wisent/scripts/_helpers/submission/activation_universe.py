@@ -29,10 +29,25 @@ from wisent_compute.coverage import (
     Verifier,
 )
 
-from wisent.scripts.activations.extract_and_upload import VALIDATED_STRATEGIES
 from wisent.scripts._helpers.submission.submit_top_level_benchmarks import (
     load_benchmark_names,
 )
+
+# Canonical 7-strategy list. This duplicates VALIDATED_STRATEGIES in
+# wisent.scripts.activations.extract_and_upload to avoid importing that
+# module: as of wisent-tools 0.1.20 (commit 98a483e) extract_and_upload
+# has a SyntaxError at line 460 (try-block indentation), so any import
+# of it raises and would break this Universe's discovery via entry_points.
+# Update both lists together when strategies change.
+VALIDATED_STRATEGIES = [
+    "chat_last",
+    "chat_mean",
+    "chat_first",
+    "chat_max_norm",
+    "chat_weighted",
+    "mc_balanced",
+    "role_play",
+]
 
 HF_REPO = "wisent-ai/activations"
 HF_BASE = "https://huggingface.co"
