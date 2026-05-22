@@ -104,6 +104,11 @@ HF_REPO_ID = "wisent-ai/activations"
 HF_REPO_TYPE = "dataset"
 RAW_PROMPT_FORMATS = ("chat", "mc_balanced", "role_play")
 CHUNK_SIZE = 10000
+# Map prompt_format -> upstream ExtractionStrategy enum value. The 5
+# chat_* strategies share the same forward pass (raw=True preserves
+# tokens), so any chat_* value gives the chat pass. Live failure
+# 2026-05-22 on job 0fbc8615: 'chat' is not a valid ExtractionStrategy.
+_PF2STRAT = {"chat": "chat_last", "mc_balanced": "mc_balanced", "role_play": "role_play"}
 
 
 def _safe(model: str) -> str:
@@ -132,7 +137,7 @@ def _run_raw_extraction(
         model=model,
         device=device,
         layers=layers,
-        extraction_strategy=prompt_format,
+        extraction_strategy=_PF2STRAT[prompt_format],
         extraction_component=component,
         batch_size=DEFAULT_BATCH_FLOOR,
         verbose=False,
