@@ -206,32 +206,6 @@ def _upload_staging(
     )
 
 
-def _shard_raw_output(out_file: Path, model: str, task: str, prompt_format: str) -> int:
-    """Convert the extractor's JSON output to the migrate_raw.py
-    safetensors layout, upload to HF, return n_layers uploaded."""
-    with open(out_file) as f:
-        doc = json.load(f)
-    by_layer = _collect_per_layer(doc)
-    if not by_layer:
-        raise RuntimeError(
-            f"raw extraction produced no per-layer activations for "
-            f"({model}, {task}, {prompt_format}). Check that "
-            f"execute_get_activations(raw=True) returns "
-            f"layers_activations in the output JSON."
-        )
-    staging = Path(tempfile.mkdtemp(prefix="wisent_raw_stage_"))
-    try:
-        for layer, entries in sorted(by_layer.items()):
-            for ci in range(0, len(entries), CHUNK_SIZE):
-                chunk = entries[ci:ci + CHUNK_SIZE]
-                out_path = staging / _raw_hf_path(
-                    model, task, prompt_format, layer, ci // CHUNK_SIZE,
-                )
-                _save_layer_chunk(out_path, chunk)
-        _upload_staging(staging, model, task, prompt_format, len(by_layer))
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    return len(by_layer)
 
 
 def main() -> int:
@@ -259,31 +233,25 @@ def main() -> int:
         owns = True
 
     pairs_file = work_dir / f"{args.task}__pairs.json"
-    out_file = work_dir / f"{args.task}__{args.prompt_format}__raw.json"
-    print(
-        f"[{args.task}/{args.prompt_format}] raw_extract_and_upload start "
-        f"model={args.model} layers={args.layers}",
-        flush=True,
-    )
+    print(f"[{args.task}/{args.prompt_format}] start model={args.model}", flush=True)
     _strip_broken_torchvision()
+    staging = Path(tempfile.mkdtemp(prefix="wisent_raw_stage_"))
     try:
         generate_pairs(args.task, pairs_file, limit=args.limit)
         cached = _try_preload_model(args.model, args.device)
-        _run_raw_extraction(
-            pairs_file=pairs_file, output_file=out_file,
-            model=args.model, prompt_format=args.prompt_format,
-            component=args.component, device=args.device,
-            layers=args.layers, cached_model=cached,
+        n_layers = _stream_extract_to_safetensors(
+            pairs_file=pairs_file, staging=staging,
+            model=args.model, task=args.task,
+            prompt_format=args.prompt_format, component=args.component,
+            device=args.device, layers=args.layers, cached_model=cached,
         )
-        n_layers = _shard_raw_output(
-            out_file, args.model, args.task, args.prompt_format,
-        )
+        _upload_staging(staging, args.model, args.task, args.prompt_format, n_layers)
         print(
-            f"[{args.task}/{args.prompt_format}] uploaded {n_layers} layers "
-            f"to raw_activations/{_safe(args.model)}/{args.task}/{args.prompt_format}/",
+            f"[{args.task}/{args.prompt_format}] uploaded {n_layers} layers",
             flush=True,
         )
     finally:
+        shutil.rmtree(staging, ignore_errors=True)
         if owns:
             shutil.rmtree(work_dir, ignore_errors=True)
     return 0
