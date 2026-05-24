@@ -59,63 +59,148 @@ def _wisent_bin() -> str:
     return found
 
 
-def _filter_already_extracted_pairs(pairs_file, model, task, strategies, component):
-    """Read existing layer-1 shards on HF for (model, task, strategies); collect
-    every stable_id present; rewrite pairs_file to exclude those. Empties out
-    the file if nothing left. Idempotent re-runs no longer redo work."""
-    import json, hashlib
+def _pair_stable_id(p):
+    """Deterministic stable_id for a pair. Use explicit field
+    when present, else compute sha256(prompt + pos + neg)[:16]
+    matching the writer convention in activation_cache.py."""
+    import hashlib
+    s = p.get("stable_id", "")
+    if s:
+        return s
+    prompt = p.get("prompt", "") or ""
+    pos_text = (p.get("positive_response", {}).get("text") or
+                p.get("positive_response", {}).get("model_response") or "")
+    neg_text = (p.get("negative_response", {}).get("text") or
+                p.get("negative_response", {}).get("model_response") or "")
+    return hashlib.sha256(
+        (prompt + "\x1f" + pos_text + "\x1f" + neg_text).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+_SHARD_MISSING = "missing"
+_SHARD_OPAQUE = "opaque"
+_SHARD_VERIFIABLE = "verifiable"
+
+
+def _strategy_shard_state(model, task, strategy, component):
+    """Return (state, stable_ids) for HF layer_1 shard.
+
+    state values:
+      _SHARD_MISSING    : no shard at this path. Caller should
+                          re-extract everything from scratch.
+      _SHARD_OPAQUE     : shard exists but lacks stable_ids
+                          metadata (pre-wisent-0.11.30 format).
+                          Caller MUST skip the strategy. Re-
+                          extracting and merging would clobber
+                          the existing rows because
+                          _merge_existing_shard drops rows with
+                          no matching stable_id from the new
+                          batch.
+      _SHARD_VERIFIABLE : stable_ids present; coverage check OK.
+    """
+    import json
     from huggingface_hub import hf_hub_download
     from wisent.core.reading.modules.utilities.data.sources.hf.hf_config import (
         HF_REPO_ID, HF_REPO_TYPE, model_to_safe_name,
     )
     from safetensors import safe_open
     safe = model_to_safe_name(model)
-    extracted = set()
-    for s in strategies:
-        hf_strat = f"{s}/{component}" if component != "residual_stream" else s
-        for layer in (1,):  # stable_ids are layer-invariant; layer 1 is enough
-            hp = f"activations/{safe}/{task}/{hf_strat}/layer_{layer}.safetensors"
-            try:
-                local = hf_hub_download(
-                    repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE,
-                    filename=hp, token=os.environ.get("HF_TOKEN") or None,
-                )
-            except Exception:
-                continue
-            try:
-                with safe_open(local, framework="pt") as so:
-                    meta = so.metadata() or {}
-                ids = json.loads(meta.get("stable_ids", "[]"))
-                extracted.update(ids)
-            except Exception:
-                pass
-    if not extracted:
-        return
+    hf_strat = f"{strategy}/{component}" if component != "residual_stream" else strategy
+    hp = f"activations/{safe}/{task}/{hf_strat}/layer_1.safetensors"
+    try:
+        local = hf_hub_download(
+            repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE,
+            filename=hp, token=os.environ.get("HF_TOKEN") or None,
+        )
+    except Exception:
+        return _SHARD_MISSING, set()
+    try:
+        with safe_open(local, framework="pt") as so:
+            meta = so.metadata() or {}
+    except Exception:
+        return _SHARD_OPAQUE, set()
+    raw = meta.get("stable_ids", "")
+    if not raw:
+        return _SHARD_OPAQUE, set()
+    try:
+        sids = json.loads(raw)
+    except Exception:
+        return _SHARD_OPAQUE, set()
+    if not sids:
+        return _SHARD_OPAQUE, set()
+    return _SHARD_VERIFIABLE, set(sids)
+
+
+def _strategies_pending(pairs_file, model, task, strategies, component):
+    """Return (pending, skipped, requested_count, union_missing_sids).
+
+    Decision matrix per strategy:
+      shard MISSING    -> pending; union_missing |= requested_sids
+      shard OPAQUE     -> SKIPPED (pre-stable_ids format; re-extract
+                          would clobber via merge wiping rows that
+                          have no matching stable_id in the new
+                          batch). Operator must migrate the shard
+                          before re-running.
+      shard VERIFIABLE -> coverage check via requested - done.
+                          empty missing -> skipped.
+                          nonempty       -> pending; union_missing |= missing."""
+    import json
     with open(pairs_file) as f:
         doc = json.load(f)
     pairs = doc.get("pairs", [])
-    def _sid(p):
-        s = p.get("stable_id","")
-        if s: return s
-        prompt = p.get("prompt","") or ""
-        pos_text = (p.get("positive_response",{}).get("text") or
-                    p.get("positive_response",{}).get("model_response") or "")
-        neg_text = (p.get("negative_response",{}).get("text") or
-                    p.get("negative_response",{}).get("model_response") or "")
-        return hashlib.sha256(
-            (prompt + "\x1f" + pos_text + "\x1f" + neg_text).encode("utf-8")
-        ).hexdigest()[:16]
-    kept = [p for p in pairs if _sid(p) not in extracted]
+    requested_sids = {_pair_stable_id(p) for p in pairs}
+    pending = []
+    skipped = []
+    union_missing = set()
+    for s in strategies:
+        state, done = _strategy_shard_state(model, task, s, component)
+        if state == _SHARD_MISSING:
+            pending.append(s)
+            union_missing |= requested_sids
+            continue
+        if state == _SHARD_OPAQUE:
+            skipped.append(s)
+            print(
+                f"[{task}] strategy={s} HF shard exists but lacks "
+                f"stable_ids metadata (pre-0.11.30 format); SKIPPING "
+                f"to preserve existing rows. Migrate the shard to "
+                f"add stable_ids before re-running.",
+                flush=True,
+            )
+            continue
+        missing = requested_sids - done
+        if not missing:
+            skipped.append(s)
+            print(
+                f"[{task}] strategy={s} already covers all "
+                f"{len(requested_sids)} requested pairs on HF; skipping",
+                flush=True,
+            )
+        else:
+            pending.append(s)
+            union_missing |= missing
+            print(
+                f"[{task}] strategy={s} HF shard has {len(done)} of "
+                f"{len(requested_sids)} requested pairs ({len(missing)} "
+                f"missing); will re-extract and merge",
+                flush=True,
+            )
+    return pending, skipped, len(requested_sids), union_missing
+def _prune_pairs_file_to_sids(pairs_file, keep_sids):
+    """Rewrite pairs_file in place keeping only pairs whose
+    stable_id is in keep_sids. Returns (kept_count, original_count)."""
+    import json
+    with open(pairs_file) as f:
+        doc = json.load(f)
+    pairs = doc.get("pairs", [])
+    kept = [p for p in pairs if _pair_stable_id(p) in keep_sids]
     if len(kept) == len(pairs):
-        return
+        return len(kept), len(pairs)
     doc["pairs"] = kept
     doc["num_pairs"] = len(kept)
     with open(pairs_file, "w") as f:
         json.dump(doc, f)
-    print(f"[{task}] skip {len(pairs)-len(kept)}/{len(pairs)} pairs already extracted; "
-          f"processing {len(kept)} new", flush=True)
-
-
+    return len(kept), len(pairs)
 def _count_pairs_by_subtask(pairs_file: Path) -> tuple[int, dict[str, int]]:
     """Read the pairs JSON and count pairs grouped by subtask metadata.
 
@@ -447,6 +532,12 @@ def main() -> int:
     print(f"[{args.task}] pairs_file={pairs_file}", flush=True)
     pairs_initial_count, pairs_initial_subtask_counts = _count_pairs_by_subtask(pairs_file)
     print(f"[{args.task}] pairs_initial_count={pairs_initial_count}", flush=True)
+    if pairs_initial_count == 0:
+        raise SystemExit(
+            f"[{args.task}] FAIL: generate-pairs-from-task produced 0 contrastive pairs "
+            "for this task. Aborting before any extraction — uploading empty payloads "
+            "would mark the job COMPLETED while polluting HF with zero-activation shards."
+        )
 
     # Per-pair tracking: drop pairs whose stable_id already has activations
     # on HF for THIS (model, task) — strategy-agnostic: if any strategy's
@@ -455,26 +546,31 @@ def main() -> int:
     # incrementally extend coverage. Falls through silently if HF is
     # unavailable or no existing shards (first run).
     try:
-        _filter_already_extracted_pairs(pairs_file, args.model, args.task,
-                                         args.strategies, args.component)
-    pairs_post_filter_count, pairs_post_filter_subtask_counts = _count_pairs_by_subtask(pairs_file)
-    print(f"[{args.task}] pairs_post_filter_count={pairs_post_filter_count}", flush=True)
-    except Exception as _exc:
-        print(f"[{args.task}] pair-skip check failed ({_exc}); processing all pairs", flush=True)
-
-    # Decide which strategies actually need extraction (skipping ones already
-    # on HF), then load the model once if any remain. For large models this
-    # cuts ~6x of weight-loading per task.
-    cached_hf_files = _list_hf_repo_files_once()
-    pending = [
-        s for s in args.strategies
-        if not hf_already_has_strategy(
-            args.model, args.task, s, args.component, cached_hf_files,
+        pending, skipped_strategies, requested_count, union_missing = _strategies_pending(
+            pairs_file, args.model, args.task, args.strategies, args.component,
         )
-    ]
-    skipped = [s for s in args.strategies if s not in pending]
-    for s in skipped:
-        print(f"[{args.task}] strategy={s} already on HF, skipping", flush=True)
+    except Exception as _exc:
+        print(f"[{args.task}] coverage probe failed ({_exc}); processing all strategies", flush=True)
+        pending = list(args.strategies)
+        skipped_strategies = []
+        requested_count = pairs_initial_count
+        union_missing = None
+    pairs_post_filter_count = requested_count
+    pairs_post_filter_subtask_counts = pairs_initial_subtask_counts
+    print(f"[{args.task}] pending strategies={pending} skipped={skipped_strategies} requested_count={requested_count}", flush=True)
+    if not pending:
+        # Every requested strategy already coverage-complete on HF.
+        print(f"[{args.task}] all {len(args.strategies)} strategies already coverage-complete on HF for {requested_count} pairs; nothing to do", flush=True)
+        return 0
+    if union_missing is not None and len(union_missing) < requested_count:
+        # Prune pairs_file to just the pairs at least one pending
+        # strategy still needs. The GPU forward pass skips pairs
+        # every pending strategy already has. _merge_existing_shard
+        # on upload preserves the existing rows for strategies that
+        # had a strict superset of the union.
+        kept, orig = _prune_pairs_file_to_sids(pairs_file, union_missing)
+        print(f"[{args.task}] pruned pairs_file to {kept}/{orig} pairs (union of missing across pending strategies)", flush=True)
+        pairs_post_filter_count = kept
 
     profiler = GPUProfiler(
         csv_path=work_dir / f"{args.task}__profile.csv",
@@ -497,6 +593,7 @@ def main() -> int:
         print(f"[{args.task}] auto-tuned batch_size {args.batch_size} -> {effective_bs}", flush=True)
 
     failed_strategies: list[tuple[str, str]] = []
+    uploaded_strategies: set[str] = set()
     groups = _group_strategies_by_family(pending)
     for group in groups:
         group_label = "+".join(group)
@@ -519,10 +616,33 @@ def main() -> int:
             print(f"[{args.task}] group={group_label} extraction failed: {exc}; continuing", flush=True)
             continue
         for strategy, out_file in outs.items():
+            try:
+                with open(out_file) as _f:
+                    _doc = json.load(_f)
+                _num_pairs_out = int(_doc.get("num_pairs", 0))
+                _activations_present = sum(
+                    1 for _p in _doc.get("pairs", [])
+                    if _p.get("positive_response", {}).get("layers_activations")
+                )
+            except Exception as _exc:
+                failed_strategies.append((strategy, f"output unreadable: {_exc}"))
+                print(f"[{args.task}] strategy={strategy} FAIL: output unreadable ({_exc})", flush=True)
+                continue
+            if _num_pairs_out == 0 or _activations_present == 0:
+                failed_strategies.append(
+                    (strategy, f"0 activations (num_pairs={_num_pairs_out}, with_acts={_activations_present})")
+                )
+                print(
+                    f"[{args.task}] strategy={strategy} FAIL: 0 activations extracted "
+                    f"(num_pairs={_num_pairs_out}, with_acts={_activations_present}); not uploading",
+                    flush=True,
+                )
+                continue
             profiler.mark_phase(f"upload_{strategy}")
             try:
                 upload_to_hf(out_file, args.model, args.task)
                 print(f"[{args.task}] uploaded strategy={strategy}", flush=True)
+                uploaded_strategies.add(strategy)
             except Exception as exc:
                 failed_strategies.append((strategy, str(exc)))
                 print(f"[{args.task}] strategy={strategy} upload failed: {exc}; continuing", flush=True)
@@ -531,6 +651,16 @@ def main() -> int:
                 out_file.unlink()
             except OSError:
                 pass
+
+    # Catch silently-dropped strategies: any strategy in pending that
+    # neither uploaded nor recorded as failed has no output on HF.
+    # Without this check the script could exit 0 with partial output.
+    _failed_set = {s for s, _ in failed_strategies}
+    for _s in pending:
+        if _s in uploaded_strategies or _s in _failed_set:
+            continue
+        failed_strategies.append((_s, "no output produced (silent skip in group call)"))
+        print(f"[{args.task}] strategy={_s} FAIL: no output produced (silent skip)", flush=True)
 
     profiler.mark_phase("done")
     profiler.stop()

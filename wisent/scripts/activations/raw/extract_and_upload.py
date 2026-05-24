@@ -103,11 +103,8 @@ def _try_preload_model(model_id: str, device: str):
 HF_REPO_ID = "wisent-ai/activations"
 HF_REPO_TYPE = "dataset"
 RAW_PROMPT_FORMATS = ("chat", "mc_balanced", "role_play")
-CHUNK_SIZE = 10000
-# Map prompt_format -> upstream ExtractionStrategy enum value. The 5
-# chat_* strategies share the same forward pass (raw=True preserves
-# tokens), so any chat_* value gives the chat pass. Live failure
-# 2026-05-22 on job 0fbc8615: 'chat' is not a valid ExtractionStrategy.
+PAIR_CHUNK_SIZE = 25
+ARCH_MODULE_LIMIT = 500
 _PF2STRAT = {"chat": "chat_last", "mc_balanced": "mc_balanced", "role_play": "role_play"}
 
 
@@ -115,97 +112,139 @@ def _safe(model: str) -> str:
     return model.replace("/", "__")
 
 
-def _raw_hf_path(model: str, task: str, prompt_format: str, layer: int, chunk: int) -> str:
-    return (
-        f"raw_activations/{_safe(model)}/{task}/{prompt_format}/"
-        f"layer_{layer}_chunk_{chunk}.safetensors"
+def _build_collector(cached_model):
+    from wisent.core.primitives.model_interface.core.activations.hooks.activations_collector import (
+        ActivationCollector,
+    )
+    return ActivationCollector(
+        model=cached_model,
+        architecture_module_limit=ARCH_MODULE_LIMIT,
+        store_device="cpu",
     )
 
 
-def _run_raw_extraction(
-    pairs_file: Path, output_file: Path, model: str, prompt_format: str,
-    component: str, device: str, layers: str, cached_model,
-) -> None:
-    """Call wisent's in-process get-activations API with raw=True so the
-    output JSON carries per-token hidden states (not aggregated)."""
-    from wisent.core.utils.cli.analysis.analysis.geometry.get_activations import (
-        execute_get_activations,
+def _build_pair_from_dict(d: dict):
+    from wisent.core.primitives.contrastive_pairs import ContrastivePair
+    from wisent.core.primitives.contrastive_pairs.core.io.response import (
+        PositiveResponse, NegativeResponse,
     )
-    ns = SimpleNamespace(
-        pairs_file=str(pairs_file),
-        output=str(output_file),
-        model=model,
-        device=device,
-        layers=layers,
-        extraction_strategy=_PF2STRAT[prompt_format],
-        extraction_component=component,
-        batch_size=DEFAULT_BATCH_FLOOR,
-        verbose=False,
-        timing=False,
-        raw=True,
-        cached_model=cached_model,
+    pos = d["positive"] if "positive" in d else d.get(
+        "positive_response", {}).get("model_response", "")
+    neg = d["negative"] if "negative" in d else d.get(
+        "negative_response", {}).get("model_response", "")
+    return ContrastivePair(
+        prompt=d["prompt"],
+        positive_response=PositiveResponse(model_response=pos),
+        negative_response=NegativeResponse(model_response=neg),
     )
-    execute_get_activations(ns)
 
 
-def _collect_per_layer(out_doc: dict) -> dict:
-    """Group activations by layer index. Each list element is
-    (pair_id, pos_tensor_like, neg_tensor_like). pair_id is the
-    explicit field if present, else the positional index in pairs."""
-    pairs = out_doc.get("pairs", [])
-    by_layer: dict = {}
-    for idx, p in enumerate(pairs):
-        pid = int(p.get("contrastive_pair_id") or p.get("pair_id") or idx)
-        pos = p.get("positive_response", {}).get("layers_activations", {}) or {}
-        neg = p.get("negative_response", {}).get("layers_activations", {}) or {}
-        for layer_str, pos_vec in pos.items():
-            try:
-                layer = int(layer_str)
-            except (TypeError, ValueError):
-                continue
-            neg_vec = neg.get(layer_str)
-            if neg_vec is None:
-                continue
-            by_layer.setdefault(layer, []).append((pid, pos_vec, neg_vec))
-    return by_layer
-
-
-def _save_layer_chunk(out_path: Path, chunk: list) -> None:
-    """Write one safetensors file with {pos_<pid>, neg_<pid>} keys +
-    pair_ids metadata, matching migrate_raw.py's writer."""
+def _save_chunk_per_token(out_path: Path, pos_list, neg_list, pids) -> None:
+    """Per-token chunk writer: tensors are [seq_len, hidden_dim]."""
     import torch
     from safetensors.torch import save_file
     tensors: dict = {}
-    pids: list = []
-    for pid, pos_vec, neg_vec in chunk:
-        tensors[f"pos_{pid}"] = torch.as_tensor(pos_vec, dtype=torch.float32)
-        tensors[f"neg_{pid}"] = torch.as_tensor(neg_vec, dtype=torch.float32)
-        pids.append(pid)
+    for i, pid in enumerate(pids):
+        tensors[f"pos_{pid}"] = pos_list[i].to(torch.float32).contiguous()
+        tensors[f"neg_{pid}"] = neg_list[i].to(torch.float32).contiguous()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(out_path), metadata={"pair_ids": json.dumps(pids)})
 
 
-def _upload_staging(
-    staging: Path, model: str, task: str, prompt_format: str, n_layers: int,
-) -> None:
-    """Upload the raw_activations/<safe>/<task>/<prompt_format>/ subtree
-    in one commit. HfApi.upload_folder is the same call migrate_raw.py
-    uses; on 429 the script raises and the verify_command's curl HEAD
-    will surface the missing shard on the next coverage cycle."""
-    from huggingface_hub import HfApi
-    api = HfApi(token=os.environ.get("HF_TOKEN") or None)
-    api.upload_folder(
-        folder_path=str(staging),
-        path_in_repo=".",
-        repo_id=HF_REPO_ID,
-        repo_type=HF_REPO_TYPE,
-        commit_message=(
-            f"raw activations: {model}/{task}/{prompt_format} "
-            f"({n_layers} layers)"
-        ),
+def _stream_extract_to_safetensors(
+    pairs_file: Path, staging: Path, model: str, task: str,
+    prompt_format: str, component: str, device: str, layers: str,
+    cached_model,
+) -> int:
+    """Per-token streaming extraction via collect_raw — no JSON intermediate.
+    Each layer chunk file holds [seq_len, hidden_dim] tensors per pair so
+    consumers can derive any aggregation (chat_last/mean/first/max_norm/
+    weighted) without re-running the model. Memory bounded by
+    PAIR_CHUNK_SIZE × 2 × n_layers × seq_len × hidden_dim × 4 bytes."""
+    from wisent.core.primitives.model_interface.core.activations import (
+        ExtractionStrategy, ExtractionComponent,
     )
+    from wisent.core.primitives.model_interface.core.activations.pipeline.raw_collector import (
+        collect_raw,
+    )
+    strategy = ExtractionStrategy(_PF2STRAT[prompt_format])
+    comp = (ExtractionComponent.RESIDUAL_STREAM
+            if component == "residual_stream"
+            else ExtractionComponent.default())
+
+    with open(pairs_file, "r") as f:
+        doc = json.load(f)
+    pairs_list = doc.get("pairs", doc) if isinstance(doc, dict) else doc
+    if not pairs_list:
+        raise SystemExit(f"[{task}/{prompt_format}] empty pairs file")
+
+    collector = _build_collector(cached_model)
+    base = staging / "raw_activations" / _safe(model) / task / prompt_format
+    n_layers_seen = 0
+
+    for chunk_idx, start in enumerate(range(0, len(pairs_list), PAIR_CHUNK_SIZE)):
+        chunk_pairs = pairs_list[start: start + PAIR_CHUNK_SIZE]
+        per_layer_pos: dict = {}
+        per_layer_neg: dict = {}
+        pids: list = []
+        for idx, p in enumerate(chunk_pairs):
+            pid = int(p.get("contrastive_pair_id") or p.get("pair_id") or (start + idx))
+            pids.append(pid)
+            raw = collect_raw(collector, _build_pair_from_dict(p),
+                              strategy=strategy, layers=None, component=comp)
+            for layer_name, t in raw["pos_hidden_states"].items():
+                per_layer_pos.setdefault(layer_name, []).append(t)
+            for layer_name, t in raw["neg_hidden_states"].items():
+                per_layer_neg.setdefault(layer_name, []).append(t)
+
+        written: list = []
+        for layer_name in per_layer_pos:
+            try:
+                layer_int = int(layer_name)
+            except ValueError:
+                continue
+            out_path = base / f"layer_{layer_int}_chunk_{chunk_idx}.safetensors"
+            _save_chunk_per_token(
+                out_path, per_layer_pos[layer_name], per_layer_neg[layer_name], pids,
+            )
+            written.append(out_path)
+        n_layers_seen = max(n_layers_seen, len(per_layer_pos))
+        del per_layer_pos, per_layer_neg
+        # Durable per-chunk commit, gated on the fleet-wide 128/hr bucket.
+        _commit_files(written, model, task, prompt_format, f"chunk_{chunk_idx}")
+        for p in written:
+            p.unlink(missing_ok=True)
+        print(f"[{task}/{prompt_format}] chunk {chunk_idx} uploaded", flush=True)
+    n_chunks = (len(pairs_list) + PAIR_CHUNK_SIZE - 1) // PAIR_CHUNK_SIZE
+    marker = base / "_complete.json"
+    marker.write_text(json.dumps(
+        {"n_chunks": n_chunks, "n_layers": n_layers_seen, "n_pairs": len(pairs_list)}
+    ))
+    _commit_files([marker], model, task, prompt_format, "complete")
+    marker.unlink(missing_ok=True)
+    return n_layers_seen
 
 
+def _commit_files(files, model: str, task: str, prompt_format: str,
+                  label: str) -> None:
+    """One HF commit, gated by the in-package rolling-window commit
+    counter (mandatory: reserves a slot in the shared 1-hr window before
+    committing, blocks when the fleet is at the cap, raises on timeout so
+    the job retries rather than committing ungated)."""
+    if not files:
+        return
+    from .commit_rate import acquire_commit_slot
+    acquire_commit_slot()
+    from huggingface_hub import HfApi, CommitOperationAdd
+    api = HfApi(token=os.environ.get("HF_TOKEN") or None)
+    base_in_repo = f"raw_activations/{_safe(model)}/{task}/{prompt_format}"
+    ops = [CommitOperationAdd(
+        path_in_repo=f"{base_in_repo}/{p.name}", path_or_fileobj=str(p),
+    ) for p in files]
+    api.create_commit(
+        repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE, operations=ops,
+        commit_message=f"raw: {model}/{task}/{prompt_format} {label}",
+    )
 
 
 def main() -> int:
@@ -245,7 +284,6 @@ def main() -> int:
             prompt_format=args.prompt_format, component=args.component,
             device=args.device, layers=args.layers, cached_model=cached,
         )
-        _upload_staging(staging, args.model, args.task, args.prompt_format, n_layers)
         print(
             f"[{args.task}/{args.prompt_format}] uploaded {n_layers} layers",
             flush=True,
