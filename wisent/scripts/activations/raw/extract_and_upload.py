@@ -35,7 +35,7 @@ from types import SimpleNamespace
 # load. Confirmed live 2026-05-21 on job 4394727f: the agent attempted to
 # import raw.extract_and_upload, the chain hit the broken parent, and the job
 # failed at runpy with the line-460 SyntaxError. Inline the three names we
-# need (DEFAULT_BATCH_FLOOR + _try_preload_model + generate_pairs) so this
+# need (DEFAULT_BATCH_FLOOR + _preload_model + generate_pairs) so this
 # module has zero dependency on the broken parent.
 import shutil as _shutil
 import subprocess as _subprocess
@@ -86,19 +86,15 @@ def generate_pairs(task: str, out_path: Path, limit=None) -> None:
         raise SystemExit(f"pair_texts generation failed for {task} (rc={result.returncode})")
 
 
-def _try_preload_model(model_id: str, device: str):
-    """Load the WisentModel once so all layers share it. Returns model or None."""
-    try:
-        from wisent.core.primitives.models.wisent_model import WisentModel
-    except Exception as exc:
-        print(f"[preload] WisentModel import failed ({exc}); per-strategy load will be used", flush=True)
-        return None
-    try:
-        print(f"[preload] loading {model_id} on {device} (one-shot)", flush=True)
-        return WisentModel(model_id, device=device)
-    except Exception as exc:
-        print(f"[preload] model load failed ({exc}); per-strategy load will be used", flush=True)
-        return None
+def _preload_model(model_id: str, device: str):
+    """Load the WisentModel once so all layers share it. Fail fast: the
+    per-token path REQUIRES a live model (collect_raw reads
+    collector.model.tokenizer), so a None here would surface only as a
+    cryptic 'NoneType has no attribute tokenizer' mid-extraction (live
+    failure 2026-05-24, job 65743d96). Raise with the real cause instead."""
+    from wisent.core.primitives.models.wisent_model import WisentModel
+    print(f"[preload] loading {model_id} on {device} (one-shot)", flush=True)
+    return WisentModel(model_id, device=device)
 
 HF_REPO_ID = "wisent-ai/activations"
 HF_REPO_TYPE = "dataset"
@@ -235,16 +231,19 @@ def _commit_files(files, model: str, task: str, prompt_format: str,
         return
     from .commit_rate import acquire_commit_slot
     acquire_commit_slot()
-    from huggingface_hub import HfApi, CommitOperationAdd
-    api = HfApi(token=os.environ.get("HF_TOKEN") or None)
+    # Upload via the `hf` CLI in a clean subprocess: in-process create_commit
+    # segfaults CPython 3.13 in this CUDA/torch process (dmesg-confirmed).
+    import subprocess
     base_in_repo = f"raw_activations/{_safe(model)}/{task}/{prompt_format}"
-    ops = [CommitOperationAdd(
-        path_in_repo=f"{base_in_repo}/{p.name}", path_or_fileobj=str(p),
-    ) for p in files]
-    api.create_commit(
-        repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE, operations=ops,
-        commit_message=f"raw: {model}/{task}/{prompt_format} {label}",
+    local_dir = str(files[0].parent)
+    r = subprocess.run(
+        ["hf", "upload", HF_REPO_ID, local_dir, base_in_repo,
+         "--repo-type", HF_REPO_TYPE],
+        env={**os.environ, "HF_HUB_DISABLE_XET": "1"},
+        capture_output=True, text=True,
     )
+    if r.returncode != 0:
+        raise SystemExit(f"hf upload failed rc={r.returncode}: {r.stderr[-400:]}")
 
 
 def main() -> int:
@@ -277,7 +276,7 @@ def main() -> int:
     staging = Path(tempfile.mkdtemp(prefix="wisent_raw_stage_"))
     try:
         generate_pairs(args.task, pairs_file, limit=args.limit)
-        cached = _try_preload_model(args.model, args.device)
+        cached = _preload_model(args.model, args.device)
         n_layers = _stream_extract_to_safetensors(
             pairs_file=pairs_file, staging=staging,
             model=args.model, task=args.task,
