@@ -148,15 +148,15 @@ def _save_chunk_per_token(out_path: Path, pos_list, neg_list, pids) -> None:
 
 
 def _stream_extract_to_safetensors(
-    pairs_file: Path, staging: Path, model: str, task: str,
+    pairs_file: Path, out_dir: Path, model: str, task: str,
     prompt_format: str, component: str, device: str, layers: str,
     cached_model,
-) -> tuple[int, Path]:
+) -> int:
     """Per-token streaming extraction via collect_raw — no JSON intermediate.
-    Extracts ALL chunks into a flat staging dir (`staging/tx/`); the upload
-    is done as a single bulk hf-transfer/xet push AFTER the model is
-    released, so multi-GB uploads don't pin GPU memory during the
-    bandwidth-bound phase. Returns (n_layers_seen, tx_dir)."""
+    Writes every layer chunk + the _complete.json marker into `out_dir`
+    (a persistent pending dir). Extraction ONLY: the upload is handed off
+    to a detached worker after the model is released, so the GPU slot and
+    model RAM free at extraction-end, not upload-end. Returns n_layers."""
     from wisent.core.primitives.model_interface.core.activations import (
         ExtractionStrategy, ExtractionComponent,
     )
@@ -175,8 +175,7 @@ def _stream_extract_to_safetensors(
         raise SystemExit(f"[{task}/{prompt_format}] empty pairs file")
 
     collector = _build_collector(cached_model)
-    tx_dir = staging / "tx"
-    tx_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     n_layers_seen = 0
 
     for chunk_idx, start in enumerate(range(0, len(pairs_list), PAIR_CHUNK_SIZE)):
@@ -198,7 +197,7 @@ def _stream_extract_to_safetensors(
                 layer_int = int(layer_name)
             except ValueError:
                 continue
-            out_path = tx_dir / f"layer_{layer_int}_chunk_{chunk_idx}.safetensors"
+            out_path = out_dir / f"layer_{layer_int}_chunk_{chunk_idx}.safetensors"
             _save_chunk_per_token(
                 out_path, per_layer_pos[layer_name], per_layer_neg[layer_name], pids,
             )
@@ -206,32 +205,10 @@ def _stream_extract_to_safetensors(
         del per_layer_pos, per_layer_neg
         print(f"[{task}/{prompt_format}] chunk {chunk_idx} extracted", flush=True)
     n_chunks = (len(pairs_list) + PAIR_CHUNK_SIZE - 1) // PAIR_CHUNK_SIZE
-    (tx_dir / "_complete.json").write_text(json.dumps(
+    (out_dir / "_complete.json").write_text(json.dumps(
         {"n_chunks": n_chunks, "n_layers": n_layers_seen, "n_pairs": len(pairs_list)}
     ))
-    return n_layers_seen, tx_dir
-
-
-def _commit_dir(local_dir: Path, model: str, task: str,
-                prompt_format: str) -> None:
-    """One bulk HF commit of `local_dir` -> raw_activations/<safe>/<task>/<pf>.
-    Uses hf_transfer (HF's Rust parallel-chunk client) when available and
-    leaves the xet path enabled — both lift throughput well above vanilla
-    LFS-over-python on multi-GB activation uploads. Subprocess isolates
-    the CPython-3.13 _datetime null-deref segfault we hit in-process."""
-    from .commit_rate import acquire_commit_slot
-    acquire_commit_slot()
-    import subprocess
-    base_in_repo = f"raw_activations/{_safe(model)}/{task}/{prompt_format}"
-    env = {**os.environ, "HF_HUB_ENABLE_HF_TRANSFER": "1"}
-    env.pop("HF_HUB_DISABLE_XET", None)
-    r = subprocess.run(
-        ["hf", "upload", HF_REPO_ID, str(local_dir), base_in_repo,
-         "--repo-type", HF_REPO_TYPE],
-        env=env, capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        raise SystemExit(f"hf upload failed rc={r.returncode}: {r.stderr[-400:]}")
+    return n_layers_seen
 
 
 def main() -> int:
@@ -261,34 +238,40 @@ def main() -> int:
     pairs_file = work_dir / f"{args.task}__pairs.json"
     print(f"[{args.task}/{args.prompt_format}] start model={args.model}", flush=True)
     _strip_broken_torchvision()
-    staging = Path(tempfile.mkdtemp(prefix="wisent_raw_stage_"))
+    from .upload_worker import new_job_dir, handoff, sweep
+    sweep()  # re-spawn uploaders orphaned by a prior worker death / box restart
+    job_dir = new_job_dir(args.task, args.prompt_format)
     try:
         generate_pairs(args.task, pairs_file, limit=args.limit)
         cached = _preload_model(args.model, args.device)
-        n_layers, tx_dir = _stream_extract_to_safetensors(
-            pairs_file=pairs_file, staging=staging,
+        n_layers = _stream_extract_to_safetensors(
+            pairs_file=pairs_file, out_dir=job_dir / "data",
             model=args.model, task=args.task,
             prompt_format=args.prompt_format, component=args.component,
             device=args.device, layers=args.layers, cached_model=cached,
         )
-        # Release the loaded model BEFORE upload so VRAM frees while the
-        # bandwidth-bound hf upload runs — lets the agent admit more
-        # concurrent extractions during this job's upload phase.
-        del cached
+        del cached  # free the model+VRAM at extraction-end, before any upload
         try:
             import torch
             torch.cuda.empty_cache()
         except Exception:
             pass
-        _commit_dir(tx_dir, args.model, args.task, args.prompt_format)
-        print(
-            f"[{args.task}/{args.prompt_format}] uploaded {n_layers} layers",
-            flush=True,
-        )
+    except BaseException:
+        shutil.rmtree(job_dir, ignore_errors=True)  # don't upload a partial job
+        raise
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
         if owns:
             shutil.rmtree(work_dir, ignore_errors=True)
+    # Hand the upload to a detached, torch-free worker and exit immediately:
+    # the agent slot + model RAM are already free, so the GPU isn't pinned
+    # by the bandwidth-bound upload. The worker pool drains pending -> HF.
+    base_in_repo = f"raw_activations/{_safe(args.model)}/{args.task}/{args.prompt_format}"
+    handoff(job_dir, HF_REPO_ID, base_in_repo, HF_REPO_TYPE)
+    print(
+        f"[{args.task}/{args.prompt_format}] extracted {n_layers} layers; "
+        f"upload handed off (slot freed)",
+        flush=True,
+    )
     return 0
 
 
