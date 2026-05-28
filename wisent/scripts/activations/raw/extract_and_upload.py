@@ -151,12 +151,12 @@ def _stream_extract_to_safetensors(
     pairs_file: Path, staging: Path, model: str, task: str,
     prompt_format: str, component: str, device: str, layers: str,
     cached_model,
-) -> int:
+) -> tuple[int, Path]:
     """Per-token streaming extraction via collect_raw — no JSON intermediate.
-    Each layer chunk file holds [seq_len, hidden_dim] tensors per pair so
-    consumers can derive any aggregation (chat_last/mean/first/max_norm/
-    weighted) without re-running the model. Memory bounded by
-    PAIR_CHUNK_SIZE × 2 × n_layers × seq_len × hidden_dim × 4 bytes."""
+    Extracts ALL chunks into a flat staging dir (`staging/tx/`); the upload
+    is done as a single bulk hf-transfer/xet push AFTER the model is
+    released, so multi-GB uploads don't pin GPU memory during the
+    bandwidth-bound phase. Returns (n_layers_seen, tx_dir)."""
     from wisent.core.primitives.model_interface.core.activations import (
         ExtractionStrategy, ExtractionComponent,
     )
@@ -175,7 +175,8 @@ def _stream_extract_to_safetensors(
         raise SystemExit(f"[{task}/{prompt_format}] empty pairs file")
 
     collector = _build_collector(cached_model)
-    base = staging / "raw_activations" / _safe(model) / task / prompt_format
+    tx_dir = staging / "tx"
+    tx_dir.mkdir(parents=True, exist_ok=True)
     n_layers_seen = 0
 
     for chunk_idx, start in enumerate(range(0, len(pairs_list), PAIR_CHUNK_SIZE)):
@@ -192,55 +193,42 @@ def _stream_extract_to_safetensors(
                 per_layer_pos.setdefault(layer_name, []).append(t)
             for layer_name, t in raw["neg_hidden_states"].items():
                 per_layer_neg.setdefault(layer_name, []).append(t)
-
-        written: list = []
         for layer_name in per_layer_pos:
             try:
                 layer_int = int(layer_name)
             except ValueError:
                 continue
-            out_path = base / f"layer_{layer_int}_chunk_{chunk_idx}.safetensors"
+            out_path = tx_dir / f"layer_{layer_int}_chunk_{chunk_idx}.safetensors"
             _save_chunk_per_token(
                 out_path, per_layer_pos[layer_name], per_layer_neg[layer_name], pids,
             )
-            written.append(out_path)
         n_layers_seen = max(n_layers_seen, len(per_layer_pos))
         del per_layer_pos, per_layer_neg
-        # Durable per-chunk commit, gated on the fleet-wide 128/hr bucket.
-        _commit_files(written, model, task, prompt_format, f"chunk_{chunk_idx}")
-        for p in written:
-            p.unlink(missing_ok=True)
-        print(f"[{task}/{prompt_format}] chunk {chunk_idx} uploaded", flush=True)
+        print(f"[{task}/{prompt_format}] chunk {chunk_idx} extracted", flush=True)
     n_chunks = (len(pairs_list) + PAIR_CHUNK_SIZE - 1) // PAIR_CHUNK_SIZE
-    marker = base / "_complete.json"
-    marker.write_text(json.dumps(
+    (tx_dir / "_complete.json").write_text(json.dumps(
         {"n_chunks": n_chunks, "n_layers": n_layers_seen, "n_pairs": len(pairs_list)}
     ))
-    _commit_files([marker], model, task, prompt_format, "complete")
-    marker.unlink(missing_ok=True)
-    return n_layers_seen
+    return n_layers_seen, tx_dir
 
 
-def _commit_files(files, model: str, task: str, prompt_format: str,
-                  label: str) -> None:
-    """One HF commit, gated by the in-package rolling-window commit
-    counter (mandatory: reserves a slot in the shared 1-hr window before
-    committing, blocks when the fleet is at the cap, raises on timeout so
-    the job retries rather than committing ungated)."""
-    if not files:
-        return
+def _commit_dir(local_dir: Path, model: str, task: str,
+                prompt_format: str) -> None:
+    """One bulk HF commit of `local_dir` -> raw_activations/<safe>/<task>/<pf>.
+    Uses hf_transfer (HF's Rust parallel-chunk client) when available and
+    leaves the xet path enabled — both lift throughput well above vanilla
+    LFS-over-python on multi-GB activation uploads. Subprocess isolates
+    the CPython-3.13 _datetime null-deref segfault we hit in-process."""
     from .commit_rate import acquire_commit_slot
     acquire_commit_slot()
-    # Upload via the `hf` CLI in a clean subprocess: in-process create_commit
-    # segfaults CPython 3.13 in this CUDA/torch process (dmesg-confirmed).
     import subprocess
     base_in_repo = f"raw_activations/{_safe(model)}/{task}/{prompt_format}"
-    local_dir = str(files[0].parent)
+    env = {**os.environ, "HF_HUB_ENABLE_HF_TRANSFER": "1"}
+    env.pop("HF_HUB_DISABLE_XET", None)
     r = subprocess.run(
-        ["hf", "upload", HF_REPO_ID, local_dir, base_in_repo,
+        ["hf", "upload", HF_REPO_ID, str(local_dir), base_in_repo,
          "--repo-type", HF_REPO_TYPE],
-        env={**os.environ, "HF_HUB_DISABLE_XET": "1"},
-        capture_output=True, text=True,
+        env=env, capture_output=True, text=True,
     )
     if r.returncode != 0:
         raise SystemExit(f"hf upload failed rc={r.returncode}: {r.stderr[-400:]}")
@@ -277,12 +265,22 @@ def main() -> int:
     try:
         generate_pairs(args.task, pairs_file, limit=args.limit)
         cached = _preload_model(args.model, args.device)
-        n_layers = _stream_extract_to_safetensors(
+        n_layers, tx_dir = _stream_extract_to_safetensors(
             pairs_file=pairs_file, staging=staging,
             model=args.model, task=args.task,
             prompt_format=args.prompt_format, component=args.component,
             device=args.device, layers=args.layers, cached_model=cached,
         )
+        # Release the loaded model BEFORE upload so VRAM frees while the
+        # bandwidth-bound hf upload runs — lets the agent admit more
+        # concurrent extractions during this job's upload phase.
+        del cached
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        _commit_dir(tx_dir, args.model, args.task, args.prompt_format)
         print(
             f"[{args.task}/{args.prompt_format}] uploaded {n_layers} layers",
             flush=True,
