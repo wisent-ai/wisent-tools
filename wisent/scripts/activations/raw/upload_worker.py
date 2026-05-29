@@ -219,4 +219,11 @@ def run_worker(job_dir_str: str) -> int:
 
 
 if __name__ == "__main__":
+    # `--sweep`: (re)populate the worker pool for any pending dir lacking a
+    # live worker, up to the cap, then exit. Lets the agent (or an operator)
+    # repopulate the pool when extraction is gated and no live worker is left
+    # to chain-sweep — otherwise the pending pool is orphaned after a restart.
+    if len(sys.argv) > 1 and sys.argv[1] == "--sweep":
+        print(f"swept; spawned {sweep()} worker(s)")
+        raise SystemExit(0)
     raise SystemExit(run_worker(sys.argv[1]))
