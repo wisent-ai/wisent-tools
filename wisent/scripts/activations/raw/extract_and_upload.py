@@ -266,7 +266,7 @@ def main() -> int:
     # the agent slot + model RAM are already free, so the GPU isn't pinned
     # by the bandwidth-bound upload. The worker pool drains pending -> HF.
     base_in_repo = f"raw_activations/{_safe(args.model)}/{args.task}/{args.prompt_format}"
-    handoff(job_dir, HF_REPO_ID, base_in_repo, HF_REPO_TYPE)
+    handoff(job_dir, HF_REPO_ID, base_in_repo, HF_REPO_TYPE, os.environ.get("WC_JOB_ID", ""))
     print(
         f"[{args.task}/{args.prompt_format}] extracted {n_layers} layers; "
         f"upload handed off (slot freed)",

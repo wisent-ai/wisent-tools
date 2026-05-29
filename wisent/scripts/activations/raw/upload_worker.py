@@ -19,6 +19,7 @@ concurrency the agent's RAM admission gate governs.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -81,13 +82,40 @@ def spawn_worker(job_dir: Path) -> bool:
 
 
 def handoff(job_dir: Path, repo_id: str, base_in_repo: str,
-            repo_type: str) -> None:
-    """Record upload metadata, then hand the dir to the worker pool."""
+            repo_type: str, job_id: str = "") -> None:
+    """Record upload metadata, then hand the dir to the worker pool.
+
+    job_id (the wisent-compute job id) is recorded so the worker can flip the
+    job's state from 'completed' (extraction done) to 'uploaded' once the data
+    actually lands on HF."""
     (job_dir / ".upload_meta").write_text(
-        f"{repo_id}\n{base_in_repo}\n{repo_type}\n"
+        f"{repo_id}\n{base_in_repo}\n{repo_type}\n{job_id}\n"
     )
     spawn_worker(job_dir)
     sweep()
+
+
+def _mark_uploaded(job_id: str) -> None:
+    """Move the job's record from the 'completed' (extraction-done) GCS prefix
+    to the terminal 'uploaded' prefix, so status distinguishes activations that
+    actually reached HF from those still waiting in the upload backlog. No-op if
+    the record isn't in completed/ yet (timing edge: upload finished before the
+    agent moved the job out of running/). Best-effort — a failure here must not
+    fail the worker, since the data is already uploaded."""
+    if not job_id:
+        return
+    try:
+        from google.cloud import storage
+        bucket = storage.Client().bucket(os.environ.get("WC_BUCKET", "wisent-compute"))
+        src = bucket.blob(f"completed/{job_id}.json")
+        if not src.exists():
+            return
+        rec = json.loads(src.download_as_text())
+        rec["state"] = "uploaded"
+        bucket.blob(f"uploaded/{job_id}.json").upload_from_string(json.dumps(rec))
+        src.delete()
+    except Exception:
+        pass
 
 
 def sweep() -> int:
@@ -158,6 +186,7 @@ def run_worker(job_dir_str: str) -> int:
     (job_dir / ".uploading").write_text(str(os.getpid()))
     meta = (job_dir / ".upload_meta").read_text().splitlines()
     repo_id, base_in_repo, repo_type = meta[0], meta[1], meta[2]
+    job_id = meta[3] if len(meta) > 3 else ""
     from .commit_rate import acquire_commit_slot
     env = {**os.environ, "HF_HUB_ENABLE_HF_TRANSFER": "1"}
     env.pop("HF_HUB_DISABLE_XET", None)
@@ -174,6 +203,7 @@ def run_worker(job_dir_str: str) -> int:
             env, stall_s,
         )
         if ret == 0:
+            _mark_uploaded(job_id)
             shutil.rmtree(job_dir, ignore_errors=True)
             rc = 0
             break
