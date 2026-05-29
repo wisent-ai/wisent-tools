@@ -188,8 +188,13 @@ def run_worker(job_dir_str: str) -> int:
     repo_id, base_in_repo, repo_type = meta[0], meta[1], meta[2]
     job_id = meta[3] if len(meta) > 3 else ""
     from .commit_rate import acquire_commit_slot
-    env = {**os.environ, "HF_HUB_ENABLE_HF_TRANSFER": "1"}
-    env.pop("HF_HUB_DISABLE_XET", None)
+    # Use HF's standard LFS multipart upload, NOT xet. xet was force-enabled in
+    # 0.1.61 to speed bandwidth-bound uploads, but on this congested ~5 MB/s
+    # uplink xet's adaptive controller backs off to concurrency=1 under transfer
+    # failures and crawls far below the link rate. Disable xet (restore the
+    # agent's original default) so uploads use the full uplink.
+    env = {**os.environ, "HF_HUB_DISABLE_XET": "1"}
+    env.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
     # No-I/O-progress window after which a wedged upload child is killed and
     # retried (env-tunable; default generous so only true hangs trip it).
     stall_s = float(os.environ.get("WISENT_UPLOAD_STALL_S", str(900.0)))
