@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -108,6 +109,48 @@ def sweep() -> int:
     return spawned
 
 
+def _io_bytes(pid: int) -> int:
+    """Total bytes the process has read+written (file AND socket traffic). It
+    climbs whenever an upload makes progress and stays flat when the child is
+    wedged, so it tells a live (even very slow) transfer from a hang."""
+    try:
+        tot = 0
+        with open(f"/proc/{pid}/io") as fh:
+            for line in fh:
+                if line.startswith(("rchar:", "wchar:")):
+                    tot += int(line.split()[1])
+        return tot
+    except OSError:
+        return -1
+
+
+def _run_upload(cmd: list[str], env: dict, stall_s: float):
+    """Run `hf upload`, killing it only if it makes NO I/O progress for
+    stall_s. A healthy transfer's I/O counter keeps climbing so it is never
+    killed however slow the uplink; a wedged xet child (observed: futex
+    deadlock + leaked CLOSE-WAIT sockets, zero throughput) is broken so the
+    worker falls through to retry. A stall detector, not a wall-clock cap on
+    working uploads. Returns the child returncode, or None if killed."""
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    last_io = _io_bytes(proc.pid)
+    last_progress = time.time()
+    while True:
+        try:
+            return proc.wait(timeout=min(stall_s, 30.0))
+        except subprocess.TimeoutExpired:
+            io = _io_bytes(proc.pid)
+            if io > last_io:
+                last_io, last_progress = io, time.time()
+            elif time.time() - last_progress >= stall_s:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+                return None
+
+
 def run_worker(job_dir_str: str) -> int:
     job_dir = Path(job_dir_str)
     if not job_dir.is_dir() or not (job_dir / ".upload_meta").exists():
@@ -118,16 +161,19 @@ def run_worker(job_dir_str: str) -> int:
     from .commit_rate import acquire_commit_slot
     env = {**os.environ, "HF_HUB_ENABLE_HF_TRANSFER": "1"}
     env.pop("HF_HUB_DISABLE_XET", None)
+    # No-I/O-progress window after which a wedged upload child is killed and
+    # retried (env-tunable; default generous so only true hangs trip it).
+    stall_s = float(os.environ.get("WISENT_UPLOAD_STALL_S", str(900.0)))
     data = job_dir / "data"
     rc = 1
     for attempt in range(20):
         acquire_commit_slot()
-        r = subprocess.run(
+        ret = _run_upload(
             ["hf", "upload", repo_id, str(data), base_in_repo,
              "--repo-type", repo_type],
-            env=env, capture_output=True, text=True,
+            env, stall_s,
         )
-        if r.returncode == 0:
+        if ret == 0:
             shutil.rmtree(job_dir, ignore_errors=True)
             rc = 0
             break
