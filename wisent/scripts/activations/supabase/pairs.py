@@ -1,4 +1,4 @@
-"""Bridge between extract_and_upload and the Supabase ContrastivePair catalog.
+"""Bridge between raw activation extraction and the Supabase pair catalog.
 
 Supabase project rbqjqnouluslojmmnuqi (Wisent App, eu-west-2) holds the
 authoritative pair catalog:
@@ -13,9 +13,9 @@ authoritative pair catalog:
 The HF safetensors path used positional pair_ids (0..N-1) into a
 temporary lm-eval-generated pairs file. Those positional ids were not
 stable across re-runs and not linked to Supabase. Going forward,
-extractions should use ContrastivePair.id as the pair_id stored in
+raw extractions should use ContrastivePair.id as the pair_id stored in
 shard metadata, so a single SQL query against RawActivation can answer
-"which pairs are already extracted for this model+strategy+layer".
+"which pairs are already extracted for this model+prompt-format+layer".
 
 Requires SUPABASE_ACCESS_TOKEN env var. On macOS dev hosts the
 Supabase CLI also stores the token in the Keychain under service name
@@ -230,74 +230,12 @@ def pair_id_lookup_table(set_id: int) -> dict[str, int]:
     return table
 
 
-def insert_activations(rows: list[dict]) -> int:
-    """Bulk-insert Activation rows. Each row dict needs:
-      modelId, contrastivePairId, contrastivePairSetId, layer,
-      neuronCount, extractionStrategy, activationData (hex bytes),
-      isPositive.
-    ON CONFLICT against the @@unique([modelId, contrastivePairId,
-    layer, extractionStrategy, isPositive]) constraint keeps re-runs
-    idempotent."""
-    if not rows:
-        return 0
-    parts = []
-    for r in rows:
-        strat = _escape_sql_literal(r["extractionStrategy"])
-        parts.append(
-            f"({int(r['modelId'])}, {int(r['contrastivePairId'])}, "
-            f"{int(r.get('contrastivePairSetId') or 0)}, "
-            f"{int(r['layer'])}, {int(r['neuronCount'])}, "
-            f"'{strat}', decode('', 'hex'), "
-            f"{bool(r['isPositive'])}, NOW(), NOW())"
-        )
-    values_sql = ",\n".join(parts)
-    query = (
-        "INSERT INTO \"Activation\" ("
-        '"modelId", "contrastivePairId", "contrastivePairSetId", '
-        'layer, "neuronCount", "extractionStrategy", '
-        '"activationData", "isPositive", "createdAt", "updatedAt"'
-        ") VALUES " + values_sql +
-        " ON CONFLICT (\"modelId\", \"contrastivePairId\", layer, "
-        "\"extractionStrategy\", \"isPositive\") DO NOTHING;"
-    )
-    _run_query(query)
-    return len(rows)
-
-
-def extracted_pair_ids_via_activation(
-    model_id: int,
-    set_id: int,
-    layer: int,
-    extraction_strategy: str,
-) -> set[int]:
-    """Coverage query against the Activation table (not RawActivation).
-    Returns pair ids for which BOTH positive and negative Activation
-    rows exist at the given layer + strategy."""
-    strat = _escape_sql_literal(extraction_strategy)
-    rows = _run_query(
-        "SELECT \"contrastivePairId\" AS pid, "
-        "BOOL_OR(\"isPositive\") AS has_pos, "
-        "BOOL_OR(NOT \"isPositive\") AS has_neg "
-        "FROM \"Activation\" "
-        f"WHERE \"modelId\" = {int(model_id)} "
-        f"AND layer = {int(layer)} "
-        f"AND \"extractionStrategy\" = '{strat}' "
-        "AND \"contrastivePairId\" IN ("
-        f"  SELECT id FROM \"ContrastivePair\" WHERE \"setId\" = {int(set_id)}"
-        ") "
-        "GROUP BY \"contrastivePairId\";"
-    )
-    return {int(r["pid"]) for r in rows if r.get("has_pos") and r.get("has_neg")}
-
-
 __all__ = [
     "resolve_set_id",
     "fetch_pairs",
     "model_id_for_hf_id",
     "extracted_pair_ids_for",
-    "extracted_pair_ids_via_activation",
     "insert_raw_activations",
-    "insert_activations",
     "pair_id_lookup_table",
     "WISENT_APP_PROJECT",
 ]

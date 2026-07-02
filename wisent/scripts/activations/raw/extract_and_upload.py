@@ -2,8 +2,7 @@
 
 Writes the canonical raw_activations/<safe>/<task>/<prompt_format>/
 layer_<L>_chunk_<C>.safetensors layout that migrate_raw.py uses,
-NOT the legacy 7-strategy activations/<safe>/<task>/<strategy>/ tree
-that wisent.scripts.activations.extract_and_upload writes.
+NOT the removed foreground-upload activation tree.
 
 The agreed pipeline: extract 3 raw forward passes (chat / mc_balanced /
 role_play) per (model, task), and derive the 7 chat_*/mc_balanced/role_play
@@ -29,14 +28,10 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-# Helpers inlined to avoid `from wisent.scripts.activations.extract_and_upload`
-# — that module has a SyntaxError at line 460 in the published wheel (try/except
-# block indentation bug) and any import of it raises before this module can
-# load. Confirmed live 2026-05-21 on job 4394727f: the agent attempted to
-# import raw.extract_and_upload, the chain hit the broken parent, and the job
-# failed at runpy with the line-460 SyntaxError. Inline the three names we
-# need (DEFAULT_BATCH_FLOOR + _preload_model + generate_pairs) so this
-# module has zero dependency on the broken parent.
+# Helpers inlined to keep raw extraction independent of the removed
+# foreground uploader compatibility stub. Inline the three names we need
+# (DEFAULT_BATCH_FLOOR + _preload_model + generate_pairs) so this module
+# has zero dependency on that old entrypoint.
 import shutil as _shutil
 import subprocess as _subprocess
 
@@ -102,6 +97,29 @@ RAW_PROMPT_FORMATS = ("chat", "mc_balanced", "role_play")
 PAIR_CHUNK_SIZE = 25
 ARCH_MODULE_LIMIT = 500
 _PF2STRAT = {"chat": "chat_last", "mc_balanced": "mc_balanced", "role_play": "role_play"}
+
+
+def _upload_target() -> tuple[str, str]:
+    backend = os.environ.get("WISENT_RAW_UPLOAD_BACKEND", "hf").strip().lower()
+    if backend == "gcs":
+        uri = os.environ.get("WISENT_RAW_GCS_URI", "").strip()
+        if not uri.startswith("gs://"):
+            raise SystemExit("WISENT_RAW_UPLOAD_BACKEND=gcs requires WISENT_RAW_GCS_URI=gs://...")
+        return uri, "gcs"
+    return HF_REPO_ID, HF_REPO_TYPE
+
+
+def _configure_hf_cache() -> None:
+    """Use the large persistent disk for HF cache on the local RTX box."""
+    if os.environ.get("HF_HOME"):
+        return
+    base = Path("/mnt/wd16tb/hf_cache")
+    if not base.parent.is_dir():
+        return
+    base.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(base)
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(base / "hub"))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(base / "transformers"))
 
 
 def _safe(model: str) -> str:
@@ -212,6 +230,7 @@ def _stream_extract_to_safetensors(
 
 
 def main() -> int:
+    _configure_hf_cache()
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--task", required=True)
     p.add_argument("--model", required=True)
@@ -264,9 +283,11 @@ def main() -> int:
             shutil.rmtree(work_dir, ignore_errors=True)
     # Hand the upload to a detached, torch-free worker and exit immediately:
     # the agent slot + model RAM are already free, so the GPU isn't pinned
-    # by the bandwidth-bound upload. The worker pool drains pending -> HF.
+    # by the bandwidth-bound upload. The worker pool drains pending to the
+    # configured raw upload backend.
     base_in_repo = f"raw_activations/{_safe(args.model)}/{args.task}/{args.prompt_format}"
-    handoff(job_dir, HF_REPO_ID, base_in_repo, HF_REPO_TYPE, os.environ.get("WC_JOB_ID", ""))
+    repo_id, repo_type = _upload_target()
+    handoff(job_dir, repo_id, base_in_repo, repo_type, os.environ.get("WC_JOB_ID", ""))
     print(
         f"[{args.task}/{args.prompt_format}] extracted {n_layers} layers; "
         f"upload handed off (slot freed)",

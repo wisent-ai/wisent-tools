@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Submit one wc-queue job per (model, top-level benchmark) using the canonical
-wisent benchmark list — NOT leaf-expanded subtask names.
+"""Submit raw activation jobs for top-level benchmarks.
+
+Creates one queue job per (model, top-level benchmark, prompt format) using
+the canonical wisent benchmark list — NOT leaf-expanded subtask names.
 
 Source of truth: benchmark_tags.json (380 entries). The pair-generation
 pipeline already handles group→subtask expansion via build_contrastive_pairs
@@ -75,12 +77,15 @@ def main() -> int:
     p.add_argument("--model", required=True)
     p.add_argument("--limit", type=int, default=GSM8K_DEFAULT_LIMIT,
                    help="per-benchmark pair cap (default from constants)")
-    p.add_argument("--strategies", default="chat_last,chat_mean,chat_first,"
-                   "chat_max_norm,chat_weighted,mc_balanced,role_play")
+    p.add_argument("--prompt-formats", default="chat,mc_balanced,role_play")
     p.add_argument("--component", default="residual_stream")
     p.add_argument("--layers", default="all")
     p.add_argument("--device", default="cuda")
     p.add_argument("--priority", type=int, default=0)
+    p.add_argument("--provider", default="local", choices=("local",))
+    p.add_argument("--gpu-type", default="")
+    p.add_argument("--vram-gb", type=int, default=0)
+    p.add_argument("--exclusive", action="store_true")
     p.add_argument("--exclude", default="")
     p.add_argument("--only", default="")
     p.add_argument("--dry-run", action="store_true")
@@ -94,31 +99,19 @@ def main() -> int:
     names = [n for n in names if n not in excludes]
     print(f"Submitting {len(names)} top-level jobs for {args.model}", flush=True)
 
-    safe_model = args.model.replace("/", "__")
-    strategy_list = args.strategies.split()
-    pairs: list[tuple[str, str]] = []
+    prompt_formats = [x.strip() for x in args.prompt_formats.split(",") if x.strip()]
+    pairs: list[str] = []
     for name in names:
-        cmd = (f"python3 -m wisent.scripts.activations.extract_and_upload "
-               f"--task {name} --model '{args.model}' --device {args.device} "
-               f"--layers {args.layers} --strategies {args.strategies} "
-               f"--component {args.component} --limit {args.limit}")
-        # Post-run HF existence check. Without verify_command, slots.py
-        # marks the job COMPLETED on exit=0 even when extract_and_upload
-        # uploaded a partial set of strategies (job 00f34aa3 on
-        # 2026-05-20: 3 of 7 strategies uploaded, 4 missing, marked
-        # completed). HEAD each requested strategy's layer_1.safetensors;
-        # ANY missing strategy demotes the job to failed/ with the
-        # curl error text.
-        heads = " && ".join(
-            f'curl --fail --silent --show-error --head -o /dev/null '
-            f'-H "Authorization: Bearer ${{HF_TOKEN}}" '
-            f'"https://huggingface.co/datasets/wisent-ai/activations/'
-            f'resolve/main/activations/{safe_model}/{name}/{s}/layer_1.safetensors"'
-            for s in strategy_list
-        )
-        pairs.append((cmd, heads))
+        for prompt_format in prompt_formats:
+            cmd = (
+                "python3 -m wisent.scripts.activations.raw.extract_and_upload "
+                f"--task {name} --model '{args.model}' --device {args.device} "
+                f"--layers {args.layers} --prompt-format {prompt_format} "
+                f"--component {args.component} --limit {args.limit}"
+            )
+            pairs.append(cmd)
     if args.dry_run:
-        for c, _v in pairs:
+        for c in pairs:
             print(c)
         return 0
 
@@ -127,11 +120,12 @@ def main() -> int:
     import time as _time
     batch_id = f"batch-{int(_time.time())}-{args.model.replace('/', '_')}"
     n = 0
-    for cmd, verify in pairs:
+    for cmd in pairs:
         _submit_job(
-            cmd, provider="gcp", batch_id=batch_id, bucket=_BUCKET,
+            cmd, provider=args.provider, batch_id=batch_id, bucket=_BUCKET,
             preemptible=False, pin_to_provider=True, priority=args.priority,
-            verify_command=verify,
+            gpu_type=args.gpu_type, vram_gb=args.vram_gb,
+            exclusive=args.exclusive,
         )
         n += 1
     print(f"\nSubmitted: {n}/{len(pairs)}  batch_id={batch_id}")
