@@ -1,4 +1,4 @@
-"""Activation-extraction Universe adapter for wisent_compute.coverage.
+"""Activation-extraction Universe adapter for stado.coverage.
 
 CANONICAL DESIGN — RAW THEN TRANSFORM:
 
@@ -34,7 +34,7 @@ import os
 from pathlib import Path
 from typing import Iterator
 
-from wisent_compute.coverage import (
+from stado.coverage import (
     Universe,
     UniverseEntry,
     URIExistsVerifier,

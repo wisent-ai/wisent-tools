@@ -12,7 +12,7 @@ setup(
     include_package_data=True,
     package_data={"wisent": ["scripts/*.sh"]},
     entry_points={
-        "wisent_compute.coverage_universes": [
+        "stado.coverage_universes": [
             "activation-extraction = wisent.scripts._helpers.submission.activation_universe:ActivationExtractionUniverse",
         ],
     },

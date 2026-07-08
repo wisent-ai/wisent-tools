@@ -115,8 +115,8 @@ def main() -> int:
             print(c)
         return 0
 
-    from wisent_compute.config import BUCKET as _BUCKET
-    from wisent_compute.queue.submit import submit_job as _submit_job
+    from stado.config import BUCKET as _BUCKET
+    from stado.queue.submit import submit_job as _submit_job
     import time as _time
     batch_id = f"batch-{int(_time.time())}-{args.model.replace('/', '_')}"
     n = 0

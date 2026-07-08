@@ -22,8 +22,8 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-from wisent_compute.config import BUCKET
-from wisent_compute.queue.storage import JobStorage
+from stado.config import BUCKET
+from stado.queue.storage import JobStorage
 
 
 _MODEL_RE = re.compile(r"--model\s+['\"]?([^'\"\s]+)")
