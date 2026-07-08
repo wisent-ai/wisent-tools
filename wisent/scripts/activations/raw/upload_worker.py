@@ -278,10 +278,39 @@ def _run_upload(cmd: list[str], env: dict, stall_s: float, log_path: Path):
         _ACTIVE_UPLOAD_PGID = None
 
 
-def _upload_command(repo_id: str, data: Path, base_in_repo: str,
-                    repo_type: str) -> list[str]:
+def _build_upload_root(job_dir: Path, data: Path, base_in_repo: str) -> Path:
+    """Mirror data/ under <job_dir>/upload_root/<base_in_repo>/ via hardlinks.
+
+    `hf upload-large-folder` uploads a folder to the repo ROOT (no path-in-repo
+    arg), so to land shards at raw_activations/<model>/<task>/<format>/ the
+    local tree must already carry that prefix. Hardlinks are zero-copy on the
+    same filesystem and idempotent, so retries reuse the tree (and the tool's
+    own .cache resume state under upload_root) instead of rebuilding.
+    """
+    root = job_dir / "upload_root"
+    dest = root / base_in_repo.strip("/")
+    dest.mkdir(parents=True, exist_ok=True)
+    for src in data.rglob("*"):
+        if not src.is_file():
+            continue
+        link = dest / src.relative_to(data)
+        if link.exists():
+            continue
+        link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(src, link)
+        except OSError:
+            shutil.copy2(src, link)
+    return root
+
+
+def _upload_command(repo_id: str, upload_root: Path, repo_type: str) -> list[str]:
+    # upload-large-folder: resumable, chunked multi-commit upload built for
+    # large folders (the single-shot `upload` warns it "might fail" and has no
+    # resume). Uploads upload_root/* to the repo, preserving the mirrored
+    # raw_activations/<...> prefix.
     args = [
-        "upload", repo_id, str(data), base_in_repo,
+        "upload-large-folder", repo_id, str(upload_root),
         "--repo-type", repo_type,
     ]
     hf = shutil.which("hf")
@@ -377,19 +406,28 @@ def run_worker(job_dir_str: str) -> int:
     stall_s = float(os.environ.get("WISENT_UPLOAD_STALL_S", str(900.0)))
     data = job_dir / "data"
     log_path = job_dir / ".upload_log"
+    is_gcs = _is_gcs_target(repo_id, repo_type)
+    # Mirror data/ under the repo-path prefix once (idempotent hardlinks) so
+    # `hf upload-large-folder` (folder->repo-root, no path-in-repo) lands shards
+    # at raw_activations/<...>. GCS path uploads data/ directly, no mirror.
+    upload_root = None if is_gcs else _build_upload_root(job_dir, data, base_in_repo)
     _append_log(log_path, f"worker pid={os.getpid()} mode=concurrent_no_pause job_id={job_id} dest={base_in_repo}")
     rc = 1
     for attempt in range(20):
         if _pause_during_extract():
             _wait_for_extractors_to_clear(log_path)
-        if not _is_gcs_target(repo_id, repo_type):
+        if not is_gcs:
+            # One slot per job: upload-large-folder makes multiple internal
+            # commits, so this under-counts the fleet gate. Acceptable on the
+            # single-box HF path (throughput << 120/hr cap; HF client backs off
+            # on 429). Documented trade-off, not an oversight.
             acquire_commit_slot()
         _append_log(log_path, f"attempt={attempt + 1}")
-        if _is_gcs_target(repo_id, repo_type):
+        if is_gcs:
             ret = _run_gcs_upload(repo_id, data, base_in_repo, log_path, stall_s)
         else:
             ret = _run_upload(
-                _upload_command(repo_id, data, base_in_repo, repo_type),
+                _upload_command(repo_id, upload_root, repo_type),
                 env, stall_s, log_path,
             )
         if ret == 0:
