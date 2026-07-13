@@ -240,6 +240,19 @@ def test_writer_rejects_old_prefix_and_path_traversal_uri(tmp_path):
         raw.write_raw_activations_v2(pairs_shuffled(), m, r, tmp_path, artifact_base_uri="../escape", **kwargs)
 
 
+@pytest.mark.parametrize("suffix", ["?x", "#x"])
+def test_writer_rejects_artifact_base_uri_query_or_fragment(tmp_path, suffix):
+    m = manifest()
+    r = ref("targets/manifest.json", canonical(m))
+    with pytest.raises(ValueError, match="unsupported URI form|query|fragment|artifact_base_uri"):
+        raw.write_raw_activations_v2(
+            pairs_shuffled(), m, r, tmp_path, strategy=STRATEGY, layer_count=2,
+            activation_revision="a" * 40, model_revision="b" * 40, tokenizer_revision="c" * 40,
+            artifact_base_uri="evidence" + suffix,
+        )
+    assert not (tmp_path / "raw_activations_v2").exists()
+
+
 @pytest.mark.parametrize("slug", ["../escape", "/absolute", "nested/model", ".", ".."])
 def test_writer_rejects_unsafe_model_slug_before_filesystem_write(tmp_path, slug):
     m = manifest()

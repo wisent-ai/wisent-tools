@@ -146,6 +146,25 @@ def test_hf_publish_rejects_completion_path_traversal_and_partial_schema(tmp_pat
     assert not api.commits
 
 
+@pytest.mark.parametrize("ref_name", ["artifact", "target_manifest_ref", "source_route_ref"])
+@pytest.mark.parametrize("suffix", ["?x", "#x"])
+def test_hf_publish_rejects_query_or_fragment_in_every_canonical_ref(tmp_path, monkeypatch, ref_name, suffix):
+    job = staged_job(tmp_path)
+    api = FakeHfApi()
+    bind_fake_remote(monkeypatch, api)
+    completion_path = next((job / "data").rglob("_complete.json"))
+    completion_payload = json.loads(completion_path.read_text())
+    completion_payload[ref_name]["uri"] += suffix
+    unhashed_payload = {key: value for key, value in completion_payload.items() if key != "manifest_sha256"}
+    completion_payload.update(manifest_sha256=upload_worker.hashlib.sha256(
+        json.dumps(unhashed_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest())
+    rewrite_canonical(completion_path, completion_payload)
+    with pytest.raises(ValueError, match=f"{ref_name}.*unsafe"):
+        upload_worker.publish_v2_hf(job, "fake/repo", api=api)
+    assert not api.commits and not api.remote
+
+
 def rewrite_canonical(path, value):
     path.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
 
