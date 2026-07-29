@@ -101,9 +101,22 @@ jobs:
 
           if [ "$claims_registry" = yes ]; then
             # Forward: that exact version must be served.
-            if ! curl -sSf "https://pypi.org/pypi/$project/$baseline_version/json" >/dev/null; then
+            if ! version_json="$(curl -sSf "https://pypi.org/pypi/$project/$baseline_version/json")"; then
               echo "::error::the baseline claims $marker, but PyPI does not serve" \
                 "$project $baseline_version. Run: python3 scripts/baseline.py"
+              false
+            fi
+
+            # And that exact artefact. The tail of the marker is a filename, so a
+            # hand-edited baseline can name the right kind of artefact from the wrong
+            # release while the version beside it stays perfectly serveable — right
+            # tier, wrong file, every assertion around it satisfied.
+            artifact="${marker#*:}"
+            if ! printf '%s' "$version_json" \
+              | jq -e --arg f "$artifact" 'any(.urls[]; .filename == $f)' >/dev/null; then
+              echo "::error::the baseline marker names $artifact, which is not an" \
+                "artefact PyPI serves for $project $baseline_version." \
+                "Run: python3 scripts/baseline.py"
               false
             fi
 
