@@ -89,12 +89,26 @@ jobs:
           echo "baseline: $baseline_version"
           echo "marker: $marker"
 
+          # Which registry a marker is a claim ABOUT decides what can refute it. Lumping
+          # every non-PyPI tier into "claims no registry" would test a stado: marker by
+          # asking PyPI about it, which is not the claim the marker makes: a Stado object
+          # has to be checked with `stado storage objects releases <product>`, and the
+          # `ls`/`stat` subcommands answer about the queue store instead, reporting
+          # absence for objects that demonstrably exist (GrantCli's finding). wisent-tools
+          # is distributed through PyPI alone, so a stado: baseline is not a tier this
+          # project can be on — refused as unsupported rather than misfiled as unpublished.
           case "$marker" in
             pypi-*) claims_registry=yes ;;
-            stado:*|git-archive:*|head:*) claims_registry=no ;;
+            git-archive:*|head:*) claims_registry=no ;;
+            stado:*)
+              echo "::error::the baseline claims $marker, but wisent-tools is distributed" \
+                "through PyPI, not a Stado channel. Asserting its absence from PyPI would" \
+                "not test that claim. Run: python3 scripts/baseline.py"
+              false
+              ;;
             *)
               echo "::error::unknown baseline marker: $marker. Expected one of" \
-                "pypi-sdist:, pypi-wheel:, stado:, git-archive:, head:."
+                "pypi-sdist:, pypi-wheel:, git-archive:, head:."
               false
               ;;
           esac
