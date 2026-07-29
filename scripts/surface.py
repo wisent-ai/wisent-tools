@@ -134,12 +134,16 @@ def module_names(source: pathlib.Path, relative: pathlib.Path) -> list:
     return found
 
 
-def entry_point_names(setup: pathlib.Path) -> list:
-    """Plugin names declared to setuptools, read from the `setup()` call."""
+def setup_keywords(setup: pathlib.Path) -> dict:
+    """The keyword arguments of the `setup()` call, unevaluated.
+
+    Read rather than executed, for the same reason the surface is: running setup.py
+    imports setuptools and whatever else the file touches, and neither this gate nor
+    the baseline recovery may depend on that.
+    """
     if not setup.is_file():
-        return []
+        return {}
     tree = parse(setup)
-    found = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -147,18 +151,41 @@ def entry_point_names(setup: pathlib.Path) -> list:
         name = callee.attr if isinstance(callee, ast.Attribute) else getattr(callee, "id", None)
         if name != "setup":
             continue
-        for keyword in node.keywords:
-            if keyword.arg != "entry_points" or not isinstance(keyword.value, ast.Dict):
-                continue
-            for group, targets in zip(keyword.value.keys, keyword.value.values):
-                if not isinstance(group, ast.Constant) or not isinstance(group.value, str):
-                    raise SystemExit(
-                        f"{setup}: an entry point group is not a literal string, so "
-                        "the advertised plugin names cannot be read"
-                    )
-                for target in strings(targets):
-                    advertised = target.split("=")[int(False)].strip()
-                    found.append(f"entrypoint:{group.value}:{advertised}")
+        return {kw.arg: kw.value for kw in node.keywords if kw.arg}
+    return {}
+
+
+def setup_string(setup: pathlib.Path, keyword: str) -> str:
+    """One literal string passed to `setup()`, e.g. its name or version."""
+    value = setup_keywords(setup).get(keyword)
+    if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+        raise SystemExit(
+            f"{setup}: {keyword} is not a literal string, so it cannot be read "
+            "without running the file"
+        )
+    return value.value
+
+
+def entry_point_names(setup: pathlib.Path) -> list:
+    """Plugin names declared to setuptools, read from the `setup()` call."""
+    declared = setup_keywords(setup).get("entry_points")
+    if declared is None:
+        return []
+    if not isinstance(declared, ast.Dict):
+        raise SystemExit(
+            f"{setup}: entry_points is not a literal dict, so the advertised plugin "
+            "names cannot be read"
+        )
+    found = []
+    for group, targets in zip(declared.keys, declared.values):
+        if not isinstance(group, ast.Constant) or not isinstance(group.value, str):
+            raise SystemExit(
+                f"{setup}: an entry point group is not a literal string, so "
+                "the advertised plugin names cannot be read"
+            )
+        for target in strings(targets):
+            advertised = target.split("=")[int(False)].strip()
+            found.append(f"entrypoint:{group.value}:{advertised}")
     return found
 
 

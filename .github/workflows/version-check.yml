@@ -68,16 +68,53 @@ jobs:
             echo "Declared version matches the $change change."
           fi
 
-      - name: Refuse a baseline nobody can install
+      - name: Refuse a baseline that misdescribes itself
         if: github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
-          # released-surface.json must describe a *published* version. If it names one
-          # PyPI does not have, the baseline was hand-edited and every later comparison
-          # is measured against something nobody can install.
-          released="$(jq -r .version released-surface.json)"
-          if ! curl -sSf "https://pypi.org/pypi/wisent-tools/$released/json" >/dev/null; then
-            echo "::error::released-surface.json names $released, which is not on PyPI."
-            false
+          # released-surface.json must describe something a user can actually get, and
+          # it says which kind of thing in the first token of its "source" field. That
+          # marker is the coupling between the two files — a constant, not prose — and
+          # scripts/baseline.py writes it from its MARKER constant. Two honest states
+          # exist, and this pins the baseline to whichever one is true: a version the
+          # registry serves, whose surface came from that version's artefact, or no
+          # release at all, in which case the baseline is a tag or HEAD and must say so.
+          # A baseline claiming a release nobody can install, or claiming there is no
+          # release when PyPI serves one, makes every later comparison measure against
+          # a thing that is not what anybody installed.
+          project="$(awk -F'"' '/name=/{print $2; exit}' setup.py)"
+          baseline_version="$(jq -r .version released-surface.json)"
+          marker="$(jq -r '.source | split(" ") | first' released-surface.json)"
+          echo "project: $project"
+          echo "baseline: $baseline_version"
+          echo "marker: $marker"
+
+          case "$marker" in
+            pypi-*) claims_registry=yes ;;
+            stado:*|git-archive:*|head:*) claims_registry=no ;;
+            *)
+              echo "::error::unknown baseline marker: $marker. Expected one of" \
+                "pypi-sdist:, pypi-wheel:, stado:, git-archive:, head:."
+              false
+              ;;
+          esac
+
+          if [ "$claims_registry" = yes ]; then
+            # Forward: that exact version must be served.
+            if ! curl -sSf "https://pypi.org/pypi/$project/$baseline_version/json" >/dev/null; then
+              echo "::error::the baseline claims $marker, but PyPI does not serve" \
+                "$project $baseline_version. Run: python3 scripts/baseline.py"
+              false
+            fi
+            echo "Baseline $baseline_version is served by PyPI, recovered from $marker."
+          else
+            # Reverse: claiming no release means the registry must not have the project
+            # at all. Otherwise the baseline is dodging a real release.
+            if curl -sSf "https://pypi.org/pypi/$project/json" >/dev/null; then
+              echo "::error::the baseline claims $marker, but PyPI does serve $project," \
+                "so a published artefact exists and must be the baseline." \
+                "Run: python3 scripts/baseline.py"
+              false
+            fi
+            echo "$project is unpublished and the baseline says so."
           fi
-          echo "Baseline $released exists on PyPI."

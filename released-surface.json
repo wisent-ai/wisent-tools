@@ -1,6 +1,6 @@
 {
   "version": "0.1.111",
-  "source": "sdist published on PyPI: wisent_tools-0.1.111.tar.gz, surface read from the unpacked tree by scripts/surface.py",
+  "source": "pypi-sdist:wisent_tools-0.1.111.tar.gz unpacked and read by scripts/surface.py",
   "surface": [
     "entrypoint:wisent_compute.coverage_universes:activation-extraction",
     "export:wisent.scripts.activations.supabase.pairs:WISENT_APP_PROJECT",
