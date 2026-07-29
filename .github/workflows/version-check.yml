@@ -1,0 +1,83 @@
+name: Version check
+
+# Refuse a change whose declared version disagrees with what it did to the public
+# contract. The contract of this package is the set of commands and names it
+# advertises — the runners you reach with `python -m`, the shell script it ships, the
+# plugin names it declares, and the helpers it re-exports — so adding one is a
+# capability and removing or renaming one breaks whoever invoked it yesterday.
+#
+# The rule itself lives in one place for the whole fleet and is not copied here:
+# https://github.com/lbartoszcze/AutoVersion. This workflow supplies only the two
+# things this repository alone knows: its surface, and the version it declares.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the shared rule
+        run: pip install --quiet "git+https://github.com/lbartoszcze/AutoVersion@v0.1.0"
+
+      - name: Read the public surface
+        # No package dependencies: the surface is read from the sources with ast, so
+        # this stays cheap and cannot be broken by an unrelated dependency. A module
+        # that does not parse fails the step rather than silently shrinking the
+        # surface.
+        run: python3 scripts/surface.py > "$RUNNER_TEMP/candidate.json"
+
+      - name: Compare against the released contract
+        run: |
+          set -euo pipefail
+          released="$(jq -r .version released-surface.json)"
+          declared="$(awk -F'"' '/version=/{print $2; exit}' setup.py)"
+          echo "released: $released"
+          echo "declared: $declared"
+
+          verdict="$(autoversion decide \
+            --current "$released" \
+            --published-surface released-surface.json \
+            --candidate-surface "$RUNNER_TEMP/candidate.json" \
+            --json)"
+          echo "$verdict"
+
+          change="$(printf '%s' "$verdict" | jq -r .change)"
+          required="$(printf '%s' "$verdict" | jq -r .next)"
+
+          if [ "$declared" = "$released" ]; then
+            if [ "$change" != "internal" ]; then
+              echo "::error::The public contract changed ($change) but setup.py still" \
+                "declares the released version $released. The next version must be $required."
+              false
+            fi
+            echo "Nothing released yet and the contract is unchanged."
+          elif [ "$declared" != "$required" ]; then
+            echo "::error::setup.py declares $declared, but a $change change to" \
+              "$released requires $required."
+            false
+          else
+            echo "Declared version matches the $change change."
+          fi
+
+      - name: Refuse a baseline nobody can install
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          # released-surface.json must describe a *published* version. If it names one
+          # PyPI does not have, the baseline was hand-edited and every later comparison
+          # is measured against something nobody can install.
+          released="$(jq -r .version released-surface.json)"
+          if ! curl -sSf "https://pypi.org/pypi/wisent-tools/$released/json" >/dev/null; then
+            echo "::error::released-surface.json names $released, which is not on PyPI."
+            false
+          fi
+          echo "Baseline $released exists on PyPI."
