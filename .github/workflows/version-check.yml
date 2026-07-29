@@ -106,7 +106,25 @@ jobs:
                 "$project $baseline_version. Run: python3 scripts/baseline.py"
               false
             fi
-            echo "Baseline $baseline_version is served by PyPI, recovered from $marker."
+
+            # Being honest about the tier is not the same as being on the newest
+            # artefact of it. A release published after the baseline was generated
+            # leaves everything above still true — the file names a version PyPI really
+            # serves — while the gate quietly goes on measuring against a superseded
+            # sdist, so a capability dropped in that release reads as unchanged forever.
+            # Which of two versions is newer is the shared rule's judgement, not a
+            # string comparison belonging here. No tier-reachability check follows:
+            # pypi-sdist is the top tier, so once the baseline is the newest version
+            # served there is nothing better to move to.
+            latest="$(curl -sSf "https://pypi.org/pypi/$project/json" | jq -r .info.version)"
+            superseded="$(autoversion order --older "$baseline_version" --newer "$latest" --json | jq -r .is_newer)"
+            if [ "$superseded" = True ]; then
+              echo "::error::the baseline is $project $baseline_version, but PyPI now" \
+                "serves $latest, so every comparison measures against a superseded" \
+                "release. Run: python3 scripts/baseline.py"
+              false
+            fi
+            echo "Baseline $baseline_version is the newest release PyPI serves, recovered from $marker."
           else
             # Reverse: claiming no release means the registry must not have the project
             # at all. Otherwise the baseline is dodging a real release.
