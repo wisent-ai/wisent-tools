@@ -26,7 +26,43 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install the shared rule
-        run: pip install --quiet "git+https://github.com/lbartoszcze/AutoVersion@v0.1.0"
+        # Into a virtual environment, never the system interpreter. ubuntu-latest now
+        # resolves to an Ubuntu whose system python3 carries the externally-managed
+        # marker, so a bare `pip install` dies with
+        # error: externally-managed-environment before any check runs — a gate that can
+        # never pass, worth exactly what one that can never fail is worth. The venv
+        # sidesteps the marker without --break-system-packages, and putting its bin on
+        # GITHUB_PATH leaves every later step's `autoversion` call unchanged. This
+        # repository's own scripts stay on the system python3, which is right: they
+        # import the stdlib and nothing else.
+        run: |
+          : "${RUNNER_TEMP:=$(mktemp -d)}"
+          : "${GITHUB_PATH:=$(mktemp)}"
+          python3 -m venv "$RUNNER_TEMP/rule"
+          "$RUNNER_TEMP/rule/bin/python" -m pip install --quiet \
+            "git+https://github.com/lbartoszcze/AutoVersion@v0.1.0"
+          echo "$RUNNER_TEMP/rule/bin" >> "$GITHUB_PATH"
+          # GITHUB_PATH is read by the runner after this step exits, so it does nothing
+          # for the assertions below. Without this prepend they resolve whatever
+          # `autoversion` PATH already held: command-not-found on a clean runner, so
+          # permanently red — or a stranger's binary, which passes and vouches for a
+          # rule nobody consulted. Measured both ways. This is the same prepend
+          # GITHUB_PATH gives the later steps, applied to this one too.
+          export PATH="$RUNNER_TEMP/rule/bin:$PATH"
+          # `--help` is satisfied by ANY executable that exits zero, so establish WHICH
+          # autoversion is about to answer before believing it. Should the prepend above
+          # ever be lost in a later edit, this refuses and names the stranger, instead of
+          # going green on a stranger's answer where nobody would look.
+          resolved="$(command -v autoversion || true)"
+          case "$resolved" in
+            "$RUNNER_TEMP/rule/bin/"*) ;;
+            *)
+              echo "::error::autoversion resolves to '${resolved:-nothing}', outside the" \
+                "venv this step just built, so nothing it answers would be the rule."
+              false
+              ;;
+          esac
+          autoversion --help > /dev/null || { echo "::error::the rule does not answer"; false; }
 
       - name: Read the public surface
         # No package dependencies: the surface is read from the sources with ast, so
@@ -42,6 +78,52 @@ jobs:
           declared="$(awk -F'"' '/version=/{print $2; exit}' setup.py)"
           echo "released: $released"
           echo "declared: $declared"
+
+          # Before any verdict is consumed, make this step prove that what answers to
+          # `autoversion` is the rule and that this gate CAN refuse. A gate that has never
+          # refused is decoration, and the liveness assertion in the install step does not
+          # close that: an impostor answering a constant `internal` passes `--help` and then
+          # passes every step here, because when declared equals released `internal` IS the
+          # passing branch — a fabricated verdict leaving no trace. Three known answers
+          # close it, and no constant satisfies all three: a name removed reads `breaking`,
+          # a name added reads `additive`, the released surface against itself reads
+          # `internal`. `breaking` is by construction not `internal`, which is exactly the
+          # condition refused on below, so the refusal branch is proven reachable rather
+          # than assumed. Built from the committed baseline, not from a synthetic pair, so
+          # the same step also shows the frozen file is the one reaching the decision. And
+          # it lives in the SAME step as the decide it certifies, so it covers the binary
+          # that actually answers here; in its own step it could be reordered or made
+          # conditional and quietly stop covering anything. The removal probe keeps a
+          # non-empty candidate deliberately — the rule rejects an empty surface outright,
+          # so an empty one is not a usable known answer.
+          jq '.surface = (.surface - [(.surface | sort | first)])' released-surface.json \
+            > "$RUNNER_TEMP/one-removed.json"
+          jq '.surface = (.surface + ["refusal-self-test:a-name-no-release-ever-had"])' \
+            released-surface.json > "$RUNNER_TEMP/one-added.json"
+
+          # The rule's exit status is tested explicitly, and nothing here reads a verdict
+          # out of a command substitution containing a pipeline, where the status would be
+          # discarded and a dead rule would read as an empty answer.
+          assert_change() {
+            autoversion decide --current "$released" \
+              --published-surface released-surface.json \
+              --candidate-surface "$candidate" --json > "$RUNNER_TEMP/probe.json" || {
+                echo "::error::the rule failed on $candidate, so its verdict is unknown"
+                false
+              }
+            change="$(jq -r .change "$RUNNER_TEMP/probe.json")"
+            if [ "$change" != "$want" ]; then
+              echo "::error::what answers to autoversion called $candidate '$change'" \
+                "instead of '$want', so it is not the rule and its verdict about the real" \
+                "candidate means nothing."
+              false
+            fi
+            echo "$candidate reads as $want, as the rule requires."
+          }
+
+          candidate="$RUNNER_TEMP/one-removed.json"; want=breaking; assert_change
+          candidate="$RUNNER_TEMP/one-added.json"; want=additive; assert_change
+          candidate=released-surface.json; want=internal; assert_change
 
           verdict="$(autoversion decide \
             --current "$released" \
