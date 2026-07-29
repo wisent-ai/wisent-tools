@@ -91,12 +91,15 @@ jobs:
 
           # Which registry a marker is a claim ABOUT decides what can refute it. Lumping
           # every non-PyPI tier into "claims no registry" would test a stado: marker by
-          # asking PyPI about it, which is not the claim the marker makes: a Stado object
-          # has to be checked with `stado storage objects releases <product>`, and the
-          # `ls`/`stat` subcommands answer about the queue store instead, reporting
-          # absence for objects that demonstrably exist (GrantCli's finding). wisent-tools
-          # is distributed through PyPI alone, so a stado: baseline is not a tier this
-          # project can be on — refused as unsupported rather than misfiled as unpublished.
+          # asking PyPI about it, which is not the claim the marker makes. Refuting a
+          # Stado claim takes `stado storage objects releases <product>`, or `stado
+          # storage stat` given a full stado:// URI — that spelling is namespace-aware and
+          # distinguishes present from absent from unreachable, whereas a bare path is read
+          # as a raw queue-store key and reports absence for objects that exist, and
+          # `stado storage ls` is wrong for product objects in either spelling
+          # (GrantCli's finding, as corrected by StadoSelf). wisent-tools is distributed
+          # through PyPI alone, so a stado: baseline is not a tier this project can be
+          # on — refused as unsupported rather than misfiled as unpublished.
           case "$marker" in
             pypi-*) claims_registry=yes ;;
             git-archive:*|head:*) claims_registry=no ;;
