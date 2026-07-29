@@ -141,11 +141,25 @@ jobs:
           else
             # Reverse: claiming no release means the registry must not have the project
             # at all. Otherwise the baseline is dodging a real release.
+            #
+            # This is the one assertion here that reads a FAILED request as its answer,
+            # so it needs a positive control first. curl fails identically on no egress,
+            # a DNS failure and a registry outage as it does on not-found, and without
+            # the control the step concludes "nothing is published" exactly when it
+            # learned nothing — and the wrong answer is the passing one. Credit
+            # AgentGateway for naming it and OneB for reproducing it. A project that
+            # certainly exists proves the request path works before absence means
+            # anything.
+            if ! curl -sSf "https://pypi.org/pypi/pip/json" >/dev/null; then
+              echo "::error::cannot reach PyPI, so the absence of $project is unproven." \
+                "Refusing rather than assuming it is unpublished."
+              false
+            fi
             if curl -sSf "https://pypi.org/pypi/$project/json" >/dev/null; then
               echo "::error::the baseline claims $marker, but PyPI does serve $project," \
                 "so a published artefact exists and must be the baseline." \
                 "Run: python3 scripts/baseline.py"
               false
             fi
-            echo "$project is unpublished and the baseline says so."
+            echo "$project is absent from a reachable PyPI, and the baseline says so."
           fi
