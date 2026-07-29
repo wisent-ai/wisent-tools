@@ -159,24 +159,33 @@ jobs:
             # Reverse: claiming no release means the registry must not have the project
             # at all. Otherwise the baseline is dodging a real release.
             #
-            # This is the one assertion here that reads a FAILED request as its answer,
-            # so it needs a positive control first. curl fails identically on no egress,
-            # a DNS failure and a registry outage as it does on not-found, and without
-            # the control the step concludes "nothing is published" exactly when it
-            # learned nothing — and the wrong answer is the passing one. Credit
-            # AgentGateway for naming it and OneB for reproducing it. A project that
-            # certainly exists proves the request path works before absence means
-            # anything.
-            if ! curl -sSf "https://pypi.org/pypi/pip/json" >/dev/null; then
-              echo "::error::cannot reach PyPI, so the absence of $project is unproven." \
-                "Refusing rather than assuming it is unpublished."
-              false
-            fi
-            if curl -sSf "https://pypi.org/pypi/$project/json" >/dev/null; then
-              echo "::error::the baseline claims $marker, but PyPI does serve $project," \
+            # This is the one assertion here whose answer is a NEGATIVE, so it reads the
+            # answer's CONTENT and never curl's exit status. Under -sSf a rate limit, an
+            # error page and a permission refusal all fail exactly like not-found, so
+            # transport success is the wrong question — and a positive control on a
+            # project that certainly exists does not fix it either, because it proves the
+            # index is reachable, not that this project's endpoint answered. A refusal to
+            # authorize is a successful request whose body means nothing. PyPI states
+            # absence in words, so demand that testimony and treat anything else as no
+            # answer. Three outcomes, not two: named, stated-absent, unproven. Credit
+            # AgentGateway and Ultrareach for the residual the control missed, and OneB
+            # for the primitive.
+            #
+            # `|| true` is safe here only because both passing paths demand specific
+            # content and the fallthrough refuses; it must never be lifted into a check
+            # that reads an empty answer as agreement.
+            answer="$(curl -s "https://pypi.org/pypi/$project/json" || true)"
+            if printf '%s' "$answer" | jq -e '.info.name' >/dev/null; then
+              echo "::error::the baseline claims $marker, but PyPI names $project," \
                 "so a published artefact exists and must be the baseline." \
                 "Run: python3 scripts/baseline.py"
               false
+            elif ! printf '%s' "$answer" \
+              | jq -e '(.message // "") | ascii_downcase | contains("not found")' >/dev/null; then
+              echo "::error::PyPI did not answer about $project — no stated absence, so" \
+                "the claim in $marker is unproven. Refusing rather than assuming it is" \
+                "unpublished."
+              false
             fi
-            echo "$project is absent from a reachable PyPI, and the baseline says so."
+            echo "PyPI states $project is not there, and the baseline says so."
           fi
