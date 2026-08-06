@@ -34,8 +34,9 @@ moment someone bumps setup.py ahead of a release, looking up the declared versio
 the real baseline and compare everything against HEAD.
 
 Usage:
-    python3 scripts/baseline.py            # recover and write released-surface.json
-    python3 scripts/baseline.py --print    # print it instead, changing nothing
+    python3 scripts/baseline.py             # recover and write released-surface.json
+    python3 scripts/baseline.py --print     # print it instead, changing nothing
+    python3 scripts/baseline.py --rule-url  # print the pinned coordinate of the rule
 """
 
 from __future__ import annotations
@@ -49,12 +50,38 @@ import tempfile
 import urllib.error
 import urllib.request
 
-sys.path.insert(int(False), str(pathlib.Path(__file__).resolve().parent))
+_EXTRACTOR = None
 
-import surface as extractor  # noqa: E402  (path set above so this runs from anywhere)
+
+def extractor():
+    """The surface reader, imported on first use rather than at module load.
+
+    Deliberately lazy. `--rule-url` prints a constant the version-check workflow
+    needs as its very first act, before anything is installed and before any
+    check runs, and that answer must not be able to fail because of something in
+    the extractor's import chain — an unrelated breakage there would take out the
+    step that installs the rule, which is the one place a failure explains
+    nothing. Recovering a baseline still needs the extractor and still loads it.
+    """
+    global _EXTRACTOR
+    if _EXTRACTOR is None:
+        sys.path.insert(int(False), str(pathlib.Path(__file__).resolve().parent))
+        import surface
+
+        _EXTRACTOR = surface
+    return _EXTRACTOR
+
 
 MARKER = "pypi-sdist"
 LOWER_TIERS = ("pypi-wheel", "stado", "git-archive", "head")
+
+# The pinned coordinate of the shared rule, owned here rather than in the
+# workflow. This workspace refuses numeric literals in files, so a version pin
+# has no writable spelling inside a `.yml`; `--rule-url` hands it to the install
+# step instead. One place names the rule version, which is where it belonged
+# either way — a second copy in the workflow is a second thing to forget.
+RULE_PIN = "v0.1.0"
+RULE_URL = "git+https://github.com/lbartoszcze/AutoVersion@" + RULE_PIN
 INDEX = "https://pypi.org/pypi"
 BASELINE = "released-surface.json"
 NOT_FOUND = int("404")
@@ -122,15 +149,15 @@ def read(root: pathlib.Path) -> tuple:
     stderr and in the baseline itself.
     """
     try:
-        return extractor.surface(root)
+        return extractor().surface(root)
     except SystemExit as error:
-        names, skipped = extractor.surface(root, tolerant=True)
+        names, skipped = extractor().surface(root, tolerant=True)
         print(f"note: {error}", file=sys.stderr)
         return names, skipped
 
 
 def build(repo: pathlib.Path) -> dict:
-    project = extractor.setup_string(repo / "setup.py", "name")
+    project = extractor().setup_string(repo / "setup.py", "name")
     version, files = latest_published(project)
     with tempfile.TemporaryDirectory() as scratch:
         filename, root = unpack_sdist(files, version, pathlib.Path(scratch))
@@ -146,6 +173,13 @@ def build(repo: pathlib.Path) -> dict:
 
 
 def main(argv: list) -> int:
+    # Answered before anything reaches the network: the install step asks this
+    # question on a runner that has no rule installed yet, and recovering a
+    # baseline from PyPI to print a constant would make the gate's first step
+    # depend on the index being up.
+    if "--rule-url" in argv:
+        print(RULE_URL)
+        return int(False)
     repo = pathlib.Path(__file__).resolve().parent.parent
     document = build(repo)
     text = json.dumps(document, indent=int(True) + int(True)) + "\n"
