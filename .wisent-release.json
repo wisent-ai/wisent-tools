@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "product": "wisent-tools",
+  "releases": true,
+  "version_source": {
+    "kind": "regex",
+    "path": "setup.py",
+    "pattern": "(?m)^\\s*version=\"(?P<version>[0-9A-Za-z.+-]+)\",$"
+  },
+  "platforms": {
+    "python-package": {
+      "runner_platform": "linux-amd64",
+      "quality": [],
+      "build": {
+        "argv": ["python3", "release/build-package.py"]
+      },
+      "stage": {
+        "dist": "python-distributions"
+      }
+    }
+  },
+  "promotion": {
+    "channels": ["candidate", "stable"],
+    "reconcile": false
+  },
+  "deliveries": [
+    {
+      "name": "pypi",
+      "platform": "python-package",
+      "argv": ["python3", "release/deliver-pypi.py"],
+      "required": true,
+      "secret_env": {
+        "PYPI_TOKEN": "pypi-publisher#token"
+      }
+    }
+  ]
+}
