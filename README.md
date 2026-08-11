@@ -10,10 +10,18 @@
 
 # Wisent Tools
 
-**Wisent Tools is the operational companion package for the Wisent Python family:
-it contains activation-extraction and benchmark-evaluation runners, quality-sweep
-scripts, a provider-neutral Stado object client, immutable private-input helpers,
-and shared failure reporting.**
+Monitor and Control Your AI Agent Brain.
+
+You look at what your model says. But what was it actually thinking? Wisent shows
+you how to use information from AI activations, intermediate steps within its
+layers, to your advantage. Wisent is a full toolkit for representation
+engineering, activation steering and mechanistic interpretability. Cut
+hallucination rates, decensor your model or stop it from being detected by
+AI-generated text detectors. Your Models — Yours to Control. Better than
+fine-tuning. Better than analysing the outputs directly.
+
+Deploy the latest research in your stack. This is the operational companion package:
+the runners, sweeps and shared helpers the family uses.
 
 It is not the core `wisent` model/steering library, not a hosted evaluation
 service, and not a stable umbrella CLI. Most modules are specialized operator
