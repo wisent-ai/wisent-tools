@@ -12,7 +12,10 @@ setup(
         "wisent>=0.11.21",
         "wisent-evaluators>=0.1.0",
         "matplotlib>=3.0",
-        "wisent-errors @ git+https://github.com/wisent-ai/wisent-errors#subdirectory=python",
+        # Pinned: the failure vocabulary must not move under this CLI without a
+        # commit here. Bump deliberately.
+        "wisent-errors @ git+https://github.com/wisent-ai/wisent-errors"
+        "@e3014d2c900e499e171aeed8804da10bc7d93bf8#subdirectory=python",
     ],
     include_package_data=True,
     package_data={"wisent": ["scripts/*.sh"]},
