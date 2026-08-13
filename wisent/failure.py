@@ -42,19 +42,18 @@ from dataclasses import dataclass
 from wisent_errors import (
     CODES as _CATALOGUE,
     RETRY_EXIT,
+    code_or_fallback,
     exit_code as _exit_remap,
     from_upstream_status,
     outage,
     retryable,
     severity,
+    trim_detail,
 )
 
-#: The log line is read in a terminal, and 500 characters is what this CLI has
-#: always emitted. `wisent_errors` bounds an envelope's `detail` at 2000, but it
-#: does so inside `failure()`, which this module cannot call: the failure points
-#: here are two-segment CLI ids and there is no `impact` axis to pass. Raising
-#: the cap would change the log line, so the bound stays local until the package
-#: exposes it.
+#: How wide this CLI's log detail may be. The width is this tool's own decision
+#: and has always been 500; the rule for where to cut is `trim_detail`, so the
+#: fleet stops writing six subtly different truncations.
 _MAX_DETAIL_CHARS = int("500")
 
 #: `EX_UNAVAILABLE` from sysexits(3): the dependency, not the invocation. The
@@ -77,7 +76,7 @@ def _named_code(code: str) -> str:
     defining one of these, importing this module fails here instead of the CLI
     reporting a code that no longer means anything.
     """
-    if code not in CODES:
+    if code_or_fallback(code) != code:
         raise ImportError(f"wisent_errors no longer defines the {code!r} code")
     return code
 
@@ -218,7 +217,8 @@ def _detail(
         parts.append(f"{type(error).__name__}: {error}")
     if not parts:
         return None
-    return _SENSITIVE_RE.sub(r"\1=[redacted]", " — ".join(parts))[:_MAX_DETAIL_CHARS]
+    redacted = _SENSITIVE_RE.sub(r"\1=[redacted]", " — ".join(parts))
+    return trim_detail(redacted, _MAX_DETAIL_CHARS)
 
 
 def classify(
@@ -238,8 +238,7 @@ def classify(
     resolved = code or _from_exception(error)
     if resolved is None and status is not None:
         resolved = from_upstream_status(status)
-    if resolved not in CODES:
-        resolved = CODE_UNKNOWN
+    resolved = code_or_fallback(resolved)
     return Classification(
         code=resolved,
         service=service,
