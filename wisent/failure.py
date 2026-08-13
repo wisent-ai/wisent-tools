@@ -52,8 +52,8 @@ from wisent_errors import (
 )
 
 #: How wide this CLI's log detail may be. The width is this tool's own decision
-#: and has always been 500; the rule for where to cut is `trim_detail`, so the
-#: fleet stops writing six subtly different truncations.
+#: and has always been 500; the rule is `trim_detail`, a hard cut with the ends
+#: stripped, which is what this module and its four siblings each wrote by hand.
 _MAX_DETAIL_CHARS = int("500")
 
 #: `EX_UNAVAILABLE` from sysexits(3): the dependency, not the invocation. The
