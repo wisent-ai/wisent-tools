@@ -1,11 +1,13 @@
 [automation]
 managed = true
-source_fingerprint = "dbc6281da35551f0"
+source_fingerprint = "184ad83a9604d8e9"
 category = "agent"
+copy_status = "missing"
+approved_in = ""
 
 [banner]
-title = "Operate the complete Wisent pipeline."
-description = "Runners for activation extraction, benchmark evaluation, quality sweeps, and private inputs."
+title = "Wisent Tools"
+description = ""
 product = "Wisent"
 url = "wisent.com"
 theme = "dark"
