@@ -1,15 +1,15 @@
 [automation]
 managed = true
-source_fingerprint = "33137a2eab92a093"
-category = "benchmark"
+source_fingerprint = "dbc6281da35551f0"
+category = "agent"
 
 [banner]
 title = "Operate the complete Wisent pipeline."
 description = "Runners for activation extraction, benchmark evaluation, quality sweeps, and private inputs."
 product = "Wisent"
-url = "wisent.ai"
+url = "wisent.com"
 theme = "dark"
-layout = "benchmark-left"
+layout = "orbit-left"
 art_seed = "wisent-tools"
 width = 1584
 height = 396
