@@ -69,7 +69,7 @@ jobs:
         # this stays cheap and cannot be broken by an unrelated dependency. A module
         # that does not parse fails the step rather than silently shrinking the
         # surface.
-        run: python3 scripts/surface.py > "$RUNNER_TEMP/candidate.json"
+        run: python3 -m wisent.surface > "$RUNNER_TEMP/candidate.json"
 
       - name: Compare against the released contract
         run: |
@@ -157,7 +157,7 @@ jobs:
           # released-surface.json must describe something a user can actually get, and
           # it says which kind of thing in the first token of its "source" field. That
           # marker is the coupling between the two files — a constant, not prose — and
-          # scripts/baseline.py writes it from its MARKER constant. Two honest states
+          # tests/versioning_baseline.py writes it from its MARKER constant. Two honest states
           # exist, and this pins the baseline to whichever one is true: a version the
           # registry serves, whose surface came from that version's artefact, or no
           # release at all, in which case the baseline is a tag or HEAD and must say so.
@@ -188,7 +188,7 @@ jobs:
             stado:*)
               echo "::error::the baseline claims $marker, but wisent-tools is distributed" \
                 "through PyPI, not a Stado channel. Asserting its absence from PyPI would" \
-                "not test that claim. Run: python3 scripts/baseline.py"
+                "not test that claim. Run: python3 tests/versioning_baseline.py"
               false
               ;;
             *)
@@ -202,7 +202,7 @@ jobs:
             # Forward: that exact version must be served.
             if ! version_json="$(curl -sSf "https://pypi.org/pypi/$project/$baseline_version/json")"; then
               echo "::error::the baseline claims $marker, but PyPI does not serve" \
-                "$project $baseline_version. Run: python3 scripts/baseline.py"
+                "$project $baseline_version. Run: python3 tests/versioning_baseline.py"
               false
             fi
 
@@ -215,7 +215,7 @@ jobs:
               | jq -e --arg f "$artifact" 'any(.urls[]; .filename == $f)' >/dev/null; then
               echo "::error::the baseline marker names $artifact, which is not an" \
                 "artefact PyPI serves for $project $baseline_version." \
-                "Run: python3 scripts/baseline.py"
+                "Run: python3 tests/versioning_baseline.py"
               false
             fi
 
@@ -233,7 +233,7 @@ jobs:
             if [ "$superseded" = True ]; then
               echo "::error::the baseline is $project $baseline_version, but PyPI now" \
                 "serves $latest, so every comparison measures against a superseded" \
-                "release. Run: python3 scripts/baseline.py"
+                "release. Run: python3 tests/versioning_baseline.py"
               false
             fi
             echo "Baseline $baseline_version is the newest release PyPI serves, recovered from $marker."
@@ -260,7 +260,7 @@ jobs:
             if printf '%s' "$answer" | jq -e '.info.name' >/dev/null; then
               echo "::error::the baseline claims $marker, but PyPI names $project," \
                 "so a published artefact exists and must be the baseline." \
-                "Run: python3 scripts/baseline.py"
+                "Run: python3 tests/versioning_baseline.py"
               false
             elif ! printf '%s' "$answer" \
               | jq -e '(.message // "") | ascii_downcase | contains("not found")' >/dev/null; then
