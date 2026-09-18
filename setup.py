@@ -18,6 +18,5 @@ setup(
         "@e3014d2c900e499e171aeed8804da10bc7d93bf8#subdirectory=python",
     ],
     include_package_data=True,
-    package_data={"wisent": ["scripts/*.sh"]},
     entry_points={"console_scripts": ["wisent-tools-onboarding=wisent.onboarding:main"]},
 )

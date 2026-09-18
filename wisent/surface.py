@@ -3,13 +3,12 @@
 wisent-tools is not a library with a curated API — it is the operational toolbox of
 the wisent package family. What another repository, a cron entry or a CI job depends
 on is **which runners exist and how they are addressed**: `python -m
-wisent.scripts.activations.raw.upload_worker`, `bash
-wisent/scripts/run_quality_metrics_sweep.sh`, the `stado.coverage_universes` plugin
+wisent.activations.raw.upload_worker`, the `stado.coverage_universes` plugin
 that a sibling looks up by name, and the few helpers imported by name through
-`__all__`. Rename or drop one of those and someone's pipeline stops; add one and a
-new capability appears. So four kinds of name are the contract, each printed with the
-kind it belongs to, because the same word can be a module and an entry point through
-entirely different code:
+`__all__`. Published versions also shipped shell runners, so the reader retains
+that surface kind when recovering an older sdist. Four kinds of name make up the
+contract, each printed with the kind it belongs to, because the same word can be
+both a module and an entry point through entirely different code:
 
     run:<dotted.module>          invocable as `python -m <dotted.module>`
     sh:<path/under/wisent.sh>    shipped shell script, invoked by path
@@ -31,7 +30,6 @@ than assumed.
 
 Usage:
     python -m wisent.surface [root] [--tolerant]
-    python3 scripts/surface.py [root] [--tolerant]
 """
 
 from __future__ import annotations

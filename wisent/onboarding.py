@@ -60,6 +60,8 @@ _OPERATORS = frozenset(
     {"present", "absent", "eq", "not_eq", "contains", "gt", "gte", "lt", "lte"}
 )
 _MAX_BUNDLE_BYTES = 262_144
+# A journey graph with more screens than this is not one a first-use flow produces.
+_MAX_SCREENS = 128
 
 
 def _definition() -> dict[str, Any]:
@@ -212,7 +214,7 @@ def _validate_bundle(bundle: Any) -> dict[str, Any]:
     if not _SHA256.match(digest) or hashlib.sha256(canonical.encode("utf-8")).hexdigest() != digest:
         raise ValueError("journey content hash mismatch")
     screens = definition.get("screens")
-    if not isinstance(screens, list) or not screens or len(screens) > 128:
+    if not isinstance(screens, list) or not screens or len(screens) > _MAX_SCREENS:
         raise ValueError("invalid journey graph")
     by_id: dict[str, dict[str, Any]] = {}
     for screen in screens:
