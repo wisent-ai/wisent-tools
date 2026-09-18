@@ -54,7 +54,7 @@ from wisent_errors import (
 #: How wide this CLI's log detail may be. The width is this tool's own decision
 #: and has always been 500; the rule is `trim_detail`, a hard cut with the ends
 #: stripped, which is what this module and its four siblings each wrote by hand.
-_MAX_DETAIL_CHARS = int("500")
+_MAX_DETAIL_CHARS = 500
 
 #: `EX_UNAVAILABLE` from sysexits(3): the dependency, not the invocation. The
 #: catalogue owns it, because the retry signal has to mean one thing fleet-wide.
