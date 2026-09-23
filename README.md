@@ -156,105 +156,10 @@ inspect the exact distribution/revision required by an operational workflow.
 - **Boundary:** digest equality proves byte identity, not artifact safety,
   provenance, model behavior, or license.
 
-## How it works
+## How it works and architecture
 
-`wisent-tools` ships no service and no daemon. Every capability is a module you
-start yourself, so the process you launch is the only actor: it reads its
-credentials from its own environment, holds a model in local memory, and drives
-external systems it does not own — a model/dataset source, the Wisent pair
-catalog, an artifact store, and, for the sweep, the core `wisent` CLI.
-
-```mermaid
-flowchart LR
-    Operator["Operator or job runner"] --> Module["python -m wisent.scripts.*"]
-    Module --> Source["Model and dataset source"]
-    Module --> Catalog["Pair catalog: Model, ContrastivePairSet,<br/>ContrastivePair, RawActivation"]
-    Module --> Pending["Local pending job dirs"]
-    Pending --> Worker["Upload worker"]
-    Worker --> Store["Hugging Face dataset repo or GCS bucket"]
-    Module --> Results["JSON result files"]
-```
-
-- **Durable state:** nothing durable lives inside the package. Activation work
-  persists as rows in the Wisent PostgreSQL/Supabase catalog — the `Model`,
-  `ContrastivePairSet`, `ContrastivePair`, and `RawActivation` tables — and
-  coverage is recomputed from `RawActivation` counts rather than from local
-  bookkeeping, which is what makes an interrupted extraction resumable. Packed
-  activation shards stage in per-job directories under
-  `$TMPDIR/wisent_raw_pending`, optionally spilled to
-  `$WISENT_RAW_COLD_PENDING_ROOT` under disk pressure, and are deleted only
-  after a successful publish to a Hugging Face dataset repository or a `gs://`
-  prefix. Benchmark runners are the exception worth knowing: each writes its
-  JSON result to a fixed filename in a `results_test_evaluator/` directory
-  beside its own module inside the installed package, overwriting the previous
-  run, with no configurable output directory.
-- **Credential boundary:** every credential is supplied by the process you
-  start; the package brokers, caches, and rotates none of them. `DATABASE_URL`
-  is read at import time by the extraction helpers and its absence aborts the
-  process immediately. `SUPABASE_ACCESS_TOKEN` is preferred, falling back to a
-  `config/supabase_access_token` object in `$WC_BUCKET` read with ambient Google
-  credentials, then on macOS to the Keychain entry the Supabase CLI writes.
-  `HF_TOKEN` authenticates Hub reads and existence checks, and Google Cloud
-  access is ambient application-default credentials. A token leaves the process
-  only as an `Authorization: Bearer` header to the Supabase Management API or
-  inherited by the tool that owns it — `huggingface_cli`, `gcloud storage`, the
-  GCS client. Nothing is written back into the repository or a config file.
-- **Network boundary:** the package binds no port and accepts no inbound
-  connection; every connection is outbound and initiated by your process. The
-  required destinations are the PostgreSQL endpoint named in `DATABASE_URL` (a
-  Supabase pooler port `6543` is rewritten to `5432`, with a 30-second connect
-  timeout and TCP keepalives), `api.supabase.com/v1/projects/<ref>/database/query`
-  for catalog SQL, the Hugging Face Hub for model/dataset loading and for
-  `upload-large-folder` publication, and Google Cloud Storage for sweep results,
-  cold-tier configuration, and the shared commit-rate object. Model loading
-  passes `trust_remote_code=True`, so a model repository's own code executes in
-  your process.
-- **Failure boundary:** database writes retry a caller-supplied `--max-retries`
-  times, reconnecting between attempts and raising on the last one; a stale
-  connection is detected by a `SELECT 1` probe and replaced. Publication fails
-  closed. Staged files install create-only and raise
-  `immutable staged object conflict` instead of overwriting; result JSON is
-  written through a temporary file; published bytes are re-read and compared by
-  SHA-256, and completion markers are published only as a separate second phase,
-  so a marker never precedes verified data. Hub commits must first reserve a slot
-  from a fleet-wide rolling-hour counter capped at 120 commits, and a job that
-  cannot get one fails rather than committing ungated. An upload worker
-  distinguishes the two cases: a validation or immutability conflict is terminal
-  and stops immediately, while any other error backs off exponentially for up to
-  20 attempts, and a stalled child is killed after `WISENT_UPLOAD_STALL_S`
-  (default 900 seconds). Pending job directories outlive a restart and a later
-  sweep respawns a worker for them. The quality-metrics sweep deliberately does
-  not fail closed: it runs without `set -e`, appends each failure to a failed
-  list, and continues, so process exit `0` does not mean every benchmark
-  succeeded — read its failed/completed lists. Restoring database or object-store
-  state, and re-running a benchmark that failed mid-sweep, require operator
-  action.
-
-See [Architecture](#architecture) for the module layout behind this model.
-
-## Architecture
-
-```text
-wisent-tools distribution (shared `wisent` namespace)
-  │
-  ├─ wisent.scripts
-  │    ├─ benchmark_evaluation/*
-  │    ├─ activations/*
-  │    ├─ extract_* / fix_*
-  │    └─ run_quality_metrics_sweep.sh
-  │
-  ├─ wisent.stado             current source object client / CLI
-  ├─ wisent.stado_inputs      current source immutable input/result boundary
-  └─ wisent.failure           current source failure taxonomy
-
-external owners:
-  wisent core/evaluators · Stado API · model/dataset stores · PostgreSQL/Supabase
-  · PyTorch/Transformers/Hugging Face · GPU/worker runtime
-```
-
-The package uses `pkgutil.extend_path` because several distributions contribute
-modules under the `wisent` namespace. Import behavior therefore depends on the
-complete installed package set, not this wheel alone.
+The runtime model (durable state, credential, network and failure boundaries)
+and the module layout are described in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Quick start
 
@@ -336,67 +241,10 @@ A completed shell process can therefore contain failed benchmark entries. Inspec
 its combined result and failed/completed lists rather than treating process
 completion alone as success.
 
-## Stado object interface
+## Stado objects, private inputs and failures
 
-Current source provides:
-
-```python
-from wisent.stado import StadoClient
-
-client = StadoClient()  # reads STADO_API_URL and STADO_API_TOKEN
-objects = client.list_uri("stado://wisent-tools/evaluations")
-```
-
-`StadoClient` supports:
-
-- `get_bytes`, `get_text`, `get_json`, and atomic `get_file`;
-- `put_bytes`, canonical `put_json`, streamed `put_file`, and create-only
-  `if_absent` writes;
-- `stat`, `list`, `list_uri`, and `delete`;
-- symlink-rejecting `put_tree` and traversal-filtering `get_prefix`.
-
-The URL must be absolute HTTP(S), contain no embedded credentials/query/fragment,
-and use HTTPS except authenticated loopback. `stado://` URIs are validated before
-requests. The bearer token is sent in the `Authorization` header.
-
-CLI surface in current source:
-
-```bash
-python -m wisent.stado list stado://<namespace>/<prefix>
-python -m wisent.stado has-prefix stado://<namespace>/<prefix>
-python -m wisent.stado put-tree stado://<namespace>/<prefix> <directory>
-python -m wisent.stado put-tree --sync stado://<namespace>/<prefix> <directory>
-python -m wisent.stado get-prefix stado://<namespace>/<prefix> <directory>
-```
-
-`has-prefix` reserves exit `1` for a legitimate absent answer. Retryable dependency
-failure exits `69`; invalid configuration/input and non-retryable errors use the
-failure contract instead of masquerading as absence.
-
-## Immutable private-input contract
-
-Current `wisent.stado_inputs` recognizes product-owned paths:
-
-- `stado://wisent-tools/models/...` with `STADO_MODEL_URI` and
-  `STADO_MODEL_SHA256`;
-- `stado://wisent-tools/datasets/...` with dataset URI/digest variables;
-- `stado://wisent-tools/evaluations/<STADO_EVALUATION_ID>/<file>.json` for
-  create-only result publication.
-
-Archive extraction accepts regular files/directories only and rejects traversal,
-links, devices, and unsafe members. A machine job (`WC_JOB_ID` present) must use
-pre-staged inputs and writes immutable results to `STADO_JOB_OUTPUT_DIR` or
-`./output`; an operator process can use the authenticated Stado API.
-
-## Failure semantics
-
-`wisent.failure` classifies configuration, authentication, not-found, rate-limit,
-timeout, infrastructure-down, and unknown failures. A classification carries
-service, impact, severity, retryability, outage status, and an exit-code decision.
-
-Sensitive key/token/password fragments are redacted from the structured operator
-line. User-facing messages omit raw upstream bodies. Debug traceback output must
-still be treated as potentially sensitive.
+The Stado object interface, the immutable private-input contract and the
+failure semantics are described in [docs/interfaces.md](docs/interfaces.md).
 
 ## Security, privacy, and data handling
 
