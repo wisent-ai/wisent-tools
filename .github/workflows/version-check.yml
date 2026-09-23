@@ -9,6 +9,18 @@ name: Version check
 # The rule itself lives in one place for the whole fleet and is not copied here:
 # https://github.com/lbartoszcze/AutoVersion. This workflow supplies only the two
 # things this repository alone knows: its surface, and the version it declares.
+#
+# The pinned coordinate of that rule is not written here either: this workspace
+# refuses numeric literals in files, tests/versioning_baseline.py owns it as a constant
+# and the install step below asks for it with `--rule-url`. One place names the
+# rule version.
+#
+# No step here reads a git ref, on purpose. The baseline is recovered from a
+# published sdist and refuted against PyPI, the declared version is read out of
+# setup.py, and the surface is read out of the working tree — so there is no tag
+# question for `actions/checkout@v4`'s empty tag list to answer blindly, and no
+# tag fetch is needed. If a step ever starts asking which tags exist, it must
+# fetch them first and ask `origin`, never a working copy.
 
 on:
   pull_request:

@@ -8,6 +8,14 @@ setup(
     url="https://github.com/wisent-ai/wisent-tools",
     packages=find_namespace_packages(include=["wisent", "wisent.*"]),
     python_requires=">=3.9",
-    install_requires=["wisent>=0.11.21", "wisent-evaluators>=0.1.0", "matplotlib>=3.0", "hf_transfer>=0.1.6", "google-cloud-storage>=2.0"],
+    install_requires=[
+        "wisent>=0.11.21",
+        "wisent-evaluators>=0.1.0",
+        "matplotlib>=3.0",
+        # Pinned: the failure vocabulary must not move under this CLI without a
+        # commit here. Bump deliberately.
+        "wisent-errors @ git+https://github.com/wisent-ai/wisent-errors"
+        "@e3014d2c900e499e171aeed8804da10bc7d93bf8#subdirectory=python",
+    ],
     include_package_data=True,
 )
